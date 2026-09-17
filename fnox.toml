@@ -1,0 +1,7 @@
+default_provider = "op"
+
+[providers.op]
+type = "1password"
+
+[secrets]
+TYPESAFE_API_KEY= { provider = "op", value = "op://vault/typesafe/api/key" }
