@@ -1,6 +1,3 @@
-__pycache__/
-*.pyc
-.venv/
-dist/
-.pytest_cache/
+target/
 .env
+bench/corpus/

@@ -9,6 +9,9 @@ calibrated probabilities, evaluating every question in a request in parallel. `j
 each file chunk becomes one request carrying one question per line, and all requests fan out over
 a thread pool. A 9,000-line codebase is scored line by line in about 2 seconds for about 1 cent.
 
+`jg` is a single native binary written in Rust: about 2.8 MB, 2 ms to start, no runtime to
+install. Its only dynamic dependencies are libc and libgcc, and TLS roots are compiled in.
+
 ```console
 $ jg "which HTTP method is used after a 303 redirect"
 httpx/_client.py  relevance=1.00
@@ -55,8 +58,8 @@ tier entirely; `--json` marks it with `"match": "weak"`.
 ```console
 -- weaker: these files look related overall, but nothing in them reached 0.50; near misses (>= 0.35) shown
 
-src/jevgrep/search.py  relevance=0.68
-    122-134  0.40  def build_request(queries: list[str], chunk: Chunk, files_only: bool, ...
+src/search.rs  relevance=0.68
+    176-238  0.40  pub fn build_request(queries: &[String], chunk: &Chunk, files_only: bool, ...
 ```
 
 ## Filters in plain language
@@ -73,7 +76,7 @@ many matching rows the filter removed.
 **How it works under the hood.** Jev is unreliable on negated or compound rules and very reliable
 on atomic, positive ones, which is also what TypeSafe's docs prescribe: ask one narrow question,
 phrase it so that yes is the high answer, and compose the answers in code. Measured on 350
-labelled files (`bench/filters.py`):
+labelled files:
 
 | How the rule is put to Jev | Gate accuracy |
 |---|---|
@@ -105,7 +108,7 @@ however many queries run, and add about 10% to the tokens.
 - If a glob can say it (`-g "*.py"`, `-x "docs/*"`), use the glob: exact, free, and it skips the
   files before they are sent.
 
-End to end (`bench/filter_e2e.py`, 12 exclusion runs over two repos): of 60 rows from forbidden
+End to end (12 exclusion runs over two repos): of 60 rows from forbidden
 kinds shown without a filter, 0 remained with it. Excluding tests or benchmarks kept 100% of the
 allowed code lines; excluding "documentation" kept 73 to 88% on the Rust crate, for the reason
 above.
@@ -113,10 +116,16 @@ above.
 ## Install
 
 ```bash
-uv tool install -e .        # puts `jg` on your PATH
-# or, from this directory without installing:
-uv run jg "your question"
+cargo install --path .      # builds the release binary and puts `jg` in ~/.cargo/bin
+# or build it and copy it wherever you like:
+cargo build --release && install -m755 target/release/jg ~/.local/bin/jg
 ```
+
+The binary is self-contained, so it can be copied to any machine with the same OS and
+architecture. For a fully static Linux build, add the musl target
+(`rustup target add x86_64-unknown-linux-musl`, plus a musl C compiler for the TLS library) and
+build with `--target x86_64-unknown-linux-musl`. Cross-compiling to macOS or Windows should work
+with `cargo zigbuild`; neither the static nor the cross build has been tried yet.
 
 `jg` needs `TYPESAFE_API_KEY`. It reads the environment variable first, then falls back to
 `fnox get TYPESAFE_API_KEY`. This repo's `fnox.toml` already provides it, so inside this repo
@@ -141,7 +150,7 @@ jg QUERY [PATH ...]
 | `-n 15`, `--max-regions 5`, `-m 10` | max files per query, regions per file, pinpointed lines per file |
 | `-C N` | context lines around each pinpointed line |
 | `-g GLOB`, `-x GLOB` | include or exclude files |
-| `--json` | one object per file: `relevance`, `match` (`strong` or `weak`), `regions[]` each with `start`, `end`, `p`, `label`, `lines[]`, plus top-level `lines[]` for lines outside any shown region |
+| `--json` | one object per file: `relevance`, `match` (`strong` or `weak`), `regions[]` each with `start`, `end`, `p`, `label`, `label_line`, `lines[]`, plus top-level `lines[]` for lines outside any shown region |
 | `--no-heading` | flat rows: `path:START-END:prob:label` for regions, `path:LINE:prob:text` for lines; matches only |
 | `--triage` | pre-filter files by path first; automatic above `--max-files` (1500) |
 | `-j 32` | concurrent requests |
@@ -173,7 +182,8 @@ every thread pauses briefly and concurrency halves, then grows back on success.
 
 ## How it works
 
-1. **Discover** files with `git ls-files` (or a filtered walk outside git).
+1. **Discover** files with ripgrep's `ignore` walker, which honors `.gitignore`, `.ignore` and
+   global git excludes without needing git installed.
 2. **Split** each file into logical blocks using blank lines, indentation and definition
    keywords, then pack blocks into chunks of up to 150 lines within a token budget that shrinks
    as queries are added. Chunks break between blocks and carry 12 lines of leading context.
@@ -182,12 +192,26 @@ every thread pauses briefly and concurrency halves, then grows back on success.
    contain the code the query is looking for"), and one `noul` per non-blank line ("does line N
    directly answer the query"). With a filter, add one `noul` per category per section and per
    block, asked once regardless of the number of queries.
-4. **Select** what to show with the rules in `src/jevgrep/results.py`: a row is printed only if
+4. **Select** what to show with the rules in `src/results.rs`: a row is printed only if
    its own probability clears `-t`; no source line appears twice; every shown file carries a
    location; matches come before near misses.
 
 Requests that exceed Jev's context are halved and retried. Transient errors retry with
 exponential backoff and jitter.
+
+| Module | Role |
+|---|---|
+| `src/files.rs` | discovery, block splitting, chunking |
+| `src/filters.rs` | plain-language filter parsing, polar rules |
+| `src/search.rs` | request building, thread fan-out, answer aggregation |
+| `src/results.rs` | display rules: what is shown, in which tier |
+| `src/client.rs` | HTTP client, retries, adaptive rate limiting |
+| `src/cli.rs` | flags, rendering, exit codes |
+
+`jg` began as a Python prototype (commit `31b4c25`). The Rust port sends byte-identical requests
+and prints identical output; startup went from 160 ms to 2 ms and the installed footprint from
+about 128 MB (CPython plus packages) to 2.8 MB. A search still takes about 2 seconds, because
+that time is spent waiting on the API.
 
 ## Measured behavior
 
@@ -203,7 +227,7 @@ paraphrased to avoid the code's identifiers: nine pinpoint ("which HTTP method i
 | Confident files shown per query | 1 to 3 |
 | Cost | about 35 input tokens per line per query, $0.042 per million tokens |
 
-Question wordings were chosen by A/B inside shared requests (`bench/wording.py`), which works
+Question wordings were chosen by A/B inside shared requests, which works
 because Jev evaluates each question independently. For lines, "does line N directly answer the
 query" flags 10 to 30 times fewer stray lines than "is line N relevant", which is kept as
 `--broad`. Block questions are what make broad queries work: for the digest authentication query
@@ -226,14 +250,18 @@ probing, requests up to about 47k still passed and beyond that return HTTP 400
 ## Development
 
 ```bash
-uv run pytest -m "not live"          # unit tests, fake transport
-fnox exec -- uv run pytest           # everything, including live API tests
-fnox exec -- uv run python bench/bench.py            # known-answer benchmark, scores displayed output
-fnox exec -- uv run python bench/wording.py          # A/B question wordings
-fnox exec -- uv run python bench/inspect_query.py "query" [path]   # raw probabilities behind a result
-fnox exec -- uv run python bench/audit_output.py     # checks displayed rows: none below its bar, none twice
-fnox exec -- uv run python bench/filters.py          # A/B ways of putting a filter rule to Jev
-fnox exec -- uv run python bench/filter_templates.py # A/B category question templates, gate sweep
-fnox exec -- uv run python bench/filter_e2e.py       # filter leaks and retention on displayed rows
-JG_DEBUG=1 jg ...                    # log retry reasons
+cargo test                                            # unit and end-to-end tests against a local fake Jev
+fnox exec -- cargo test --test live -- --ignored      # live API tests (send only tiny fixture files)
+cargo clippy --all-targets -- -D warnings && cargo fmt --check
+cargo build --release && fnox exec -- python3 bench/bench.py   # known-answer benchmark; also audits the display rules
+JG_DEBUG=1 jg ...                                     # log retry reasons
 ```
+
+The end-to-end tests run the real binary against a local HTTP server, so they cover argument
+parsing, the HTTP client, retries and rendering together. `JG_BASE_URL` points `jg` at another
+endpoint, `JG_MODEL` at another model, and `JG_NO_FNOX=1` disables the fnox key lookup.
+
+The benchmark needs the httpx 0.28.1 source in `bench/corpus/httpx` (gitignored):
+`pip install --no-deps --target bench/corpus httpx==0.28.1`. The A/B experiment scripts for
+question wordings and filter templates were written against the Python prototype and live in
+git history (`git show 31b4c25 --stat -- bench`).

@@ -1,0 +1,25 @@
+[package]
+name = "jevgrep"
+version = "0.2.0"
+edition = "2021"
+rust-version = "1.82"
+description = "jg: natural-language code search powered by TypeSafe's Jev decision model"
+readme = "README.md"
+
+[[bin]]
+name = "jg"
+path = "src/main.rs"
+
+[dependencies]
+ignore = "0.4"
+lexopt = "0.3"
+regex-lite = "0.1"
+serde_json = { version = "1", features = ["preserve_order"] }
+ureq = { version = "3", default-features = false, features = ["rustls", "gzip"] }
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
