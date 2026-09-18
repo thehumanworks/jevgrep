@@ -287,7 +287,7 @@ class PackageTests(unittest.TestCase):
 
 
 class EntrypointTests(unittest.TestCase):
-    def run_check(self, fail_clippy=False):
+    def run_check(self, fail_clippy=False, optional_overrides=True):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         root = Path(temporary.name)
@@ -317,7 +317,7 @@ elif name == "shellcheck" and "--version" in args:
 elif name == "cargo" and "clippy" in args and {fail_clippy!r}:
     sys.exit(17)
 elif name == "cargo" and "build" in args:
-    target = pathlib.Path(os.environ["CARGO_TARGET_DIR"]) / "release" / "jg"
+    target = pathlib.Path(os.environ.get("CARGO_TARGET_DIR", {str(root / "target")!r})) / "release" / "jg"
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text("#!/bin/sh\\nexit 0\\n")
     target.chmod(0o755)
@@ -339,6 +339,9 @@ elif name == "cargo" and "build" in args:
             RUSTUP_HOME=str(root / "rustup"),
             CARGO_TARGET_DIR=str(root / "build-cache"),
         )
+        if not optional_overrides:
+            for variable in ("CARGO_TARGET_DIR", "RUSTC_WRAPPER", "SCCACHE_DIR", "CC", "AR"):
+                env.pop(variable, None)
         result = subprocess.run(
             ["/bin/bash", str(root / "scripts/check.sh")],
             env=env,
@@ -383,6 +386,16 @@ elif name == "cargo" and "build" in args:
         self.assertFalse(
             Path(calls[0]["env"]["HOME"]).exists(), "temporary HOME must be cleaned"
         )
+
+    def test_isolation_without_optional_overrides_on_system_bash(self):
+        # The native macOS lane exercises this with Bash 3.2, where expanding an
+        # empty array under nounset aborts before any required checks are run.
+        result, calls, _ = self.run_check(optional_overrides=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(any(call["name"] == "cargo" and "build" in call["args"] for call in calls))
+        for call in calls:
+            self.assertEqual(call["env"]["JG_NO_FNOX"], "1")
+            self.assertNotIn("CARGO_TARGET_DIR", call["env"])
 
     def test_first_failed_gate_stops_later_checks(self):
         result, calls, _ = self.run_check(fail_clippy=True)

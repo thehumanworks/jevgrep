@@ -30,7 +30,9 @@ if [[ ${1:-} != --isolated ]]; then
     fi
     if [[ -n "$executable" ]]; then ln -s "$executable" "$isolated/bin/$tool"; fi
   done
-  preserved=()
+  # Bash 3.2 (macOS) treats an empty array as unbound under set -u.
+  # Keep a mandatory isolation setting here so optional overrides can be absent.
+  preserved=("JG_NO_FNOX=1")
   for variable in CARGO_TARGET_DIR RUSTC_WRAPPER SCCACHE_DIR CC AR; do
     if [[ -n ${!variable:-} ]]; then preserved+=("$variable=${!variable}"); fi
   done
@@ -44,7 +46,7 @@ if [[ ${1:-} != --isolated ]]; then
     "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" \
     "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
     GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_NOSYSTEM=1 \
-    JG_NO_FNOX=1 JG_BASE_URL=http://127.0.0.1:9 \
+    JG_BASE_URL=http://127.0.0.1:9 \
     LANG=C LC_ALL=C TERM=dumb COLUMNS=80 PYTHONUTF8=1 PYTHONDONTWRITEBYTECODE=1 \
     "${preserved[@]}" /bin/bash "$root/scripts/check.sh" --isolated "$@"
   exit
@@ -111,6 +113,8 @@ case "$mode" in
     target=$1
     assert_target "$target"
     rust_versions
+    step 'Native helper and shell-portability tests'
+    python3 -m unittest discover -s scripts -p 'test_*.py'
     step "Native integration tests: $target"
     cargo +"$pin" test --locked --all-targets --all-features --target "$target"
     step "Locked release build: $target"

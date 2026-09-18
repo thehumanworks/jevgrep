@@ -70,6 +70,10 @@ Implementation references: `scripts/check.sh`, `scripts/check-toolchain.py`,
 `scripts/terminal-smoke.py --binary PATH [--pty]` supplies fake-API and real-terminal checks.
 The quality gate runs the full PTY harness against the host release binary; each
 native job invokes ordinary fake-API smoke against the extracted downloaded binary.
+Native lanes also run the helper suite, including an invocation through system
+`/bin/bash` with no optional build overrides. The first macOS hosted run exposed
+Bash 3.2's empty-array/nounset behavior; keeping a mandatory isolation setting in
+the environment array fixes it without relaxing `set -u` or skipping checks.
 The helper suite covers pin drift, checksum/layout/linkage failures, package-version
 and extracted-binary smoke wiring, installer checksum failure, action pins, publication
 gates, fail-fast behavior, and actual isolated child-process HOME read paths.
@@ -80,7 +84,7 @@ the aggregate in branch protection after verifying the displayed check context i
 an actual run. No repository protection settings are changed by this work.
 
 Local evidence on 2026-09-18: actionlint 1.7.12 and ShellCheck 0.11.0 passed;
-23 non-network Python helper tests passed; Rust pin/lock consistency passed.
+24 non-network Python helper tests passed; Rust pin/lock consistency passed.
 The complete isolated entrypoint passed on the shared working tree with 94 Rust
 tests passed and 8 ignored live tests, zero doctests, warnings-free docs,
 formatting, Clippy, a locked host release build, and all 11 PTY scenarios. The Linux

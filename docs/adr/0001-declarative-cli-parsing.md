@@ -87,7 +87,7 @@ Clap derive adds dependencies, build time and binary size; the release size delt
 ### Verification (2026-09-18)
 
 The parser has 21 focused tests, all passing under Rust 1.98.1. The full isolated
-`scripts/check.sh` also passes: 94 Rust tests, 8 live tests ignored, 23 helper tests,
+`scripts/check.sh` also passes: 94 Rust tests, 8 live tests ignored, 24 helper tests,
 formatting, Clippy, doctests, workflow/shell lint, release build and real PTY checks.
 `tests/fixtures/README.md` documents baseline output capture and the intentionally
 changed help/error fixtures. The final implementation report records remote evidence.
