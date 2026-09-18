@@ -115,17 +115,38 @@ above.
 
 ## Install
 
+Every [release](https://github.com/thehumanworks/jevgrep/releases) carries a prebuilt binary for
+macOS on Apple Silicon (`aarch64-apple-darwin`) and Linux on x64 and aarch64
+(`x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`). The Linux builds are static, so they
+run on any distribution regardless of its glibc.
+
+With [mise](https://mise.jdx.dev), pointed straight at this repo:
+
+```bash
+mise exec github:thehumanworks/jevgrep -- jg --help   # one-off run, nothing installed
+mise use -g github:thehumanworks/jevgrep              # or put `jg` on PATH for good
+```
+
+Or download a tarball from the releases page and drop the binary on your PATH:
+
+```bash
+tar xzf jevgrep-v0.2.0-x86_64-unknown-linux-musl.tar.gz
+install -m755 jevgrep-v0.2.0-x86_64-unknown-linux-musl/jg ~/.local/bin/jg
+```
+
+From source:
+
 ```bash
 cargo install --path .      # builds the release binary and puts `jg` in ~/.cargo/bin
 # or build it and copy it wherever you like:
 cargo build --release && install -m755 target/release/jg ~/.local/bin/jg
 ```
 
-The binary is self-contained, so it can be copied to any machine with the same OS and
-architecture. For a fully static Linux build, add the musl target
-(`rustup target add x86_64-unknown-linux-musl`, plus a musl C compiler for the TLS library) and
-build with `--target x86_64-unknown-linux-musl`. Cross-compiling to macOS or Windows should work
-with `cargo zigbuild`; neither the static nor the cross build has been tried yet.
+A source build links against the system libc, so the binary can be copied to any machine with the
+same OS, architecture and a libc at least as new. The static builds come from adding the musl
+target (`rustup target add x86_64-unknown-linux-musl`, plus a musl C compiler for the TLS library)
+and building with `--target x86_64-unknown-linux-musl`; `.github/workflows/release.yml` does
+exactly that on every `v*` tag. Windows is not built or tested.
 
 `jg` needs `TYPESAFE_API_KEY`. It reads the environment variable first, then falls back to
 `fnox get TYPESAFE_API_KEY`. This repo's `fnox.toml` already provides it, so inside this repo
