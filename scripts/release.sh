@@ -27,23 +27,27 @@ for arg in "$@"; do
     --skip-tests) skip_tests=1 ;;
     --yes|-y) assume_yes=1 ;;
     -h|--help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
-    major|minor|patch|[0-9]*) [ -n "$bump" ] && die "two versions given: $bump and $arg"; bump="$arg" ;;
+    major|minor|patch|[0-9]*) if [ -n "$bump" ]; then die "two versions given: $bump and $arg"; fi; bump="$arg" ;;
     *) die "unknown argument: $arg" ;;
   esac
 done
 [ -n "$bump" ] || die "usage: scripts/release.sh patch|minor|major|X.Y.Z [--dry-run] [--skip-tests] [--yes]"
 
-cd "$(git rev-parse --show-toplevel 2>/dev/null)" || die "not inside a git repository"
+root=$(git rev-parse --show-toplevel 2> /dev/null) || die "not inside a git repository"
+cd "$root"
 for tool in git gh cargo awk; do
   command -v "$tool" > /dev/null || die "$tool is not installed"
 done
 gh auth status > /dev/null 2>&1 || die "gh is not authenticated (run: gh auth login)"
+repo=$(gh repo view --json nameWithOwner --jq .nameWithOwner) || die "cannot reach the GitHub repo"
 
 # ---------------------------------------------------------------- preconditions
 step "Checking the working tree"
 branch=$(git symbolic-ref --short HEAD 2>/dev/null || echo "DETACHED")
 [ "$branch" = "main" ] || die "on branch '$branch'; releases are cut from main (merge your change first)"
-git diff --quiet && git diff --cached --quiet || die "working tree is dirty; commit or stash first"
+if ! git diff --quiet || ! git diff --cached --quiet; then
+  die "working tree is dirty; commit or stash first"
+fi
 
 git fetch --quiet origin main
 git merge-base --is-ancestor origin/main HEAD ||
@@ -69,12 +73,14 @@ esac
 tag="v${new}"
 
 [ "$new" != "$current" ] || die "version is already $current"
-git rev-parse -q --verify "refs/tags/$tag" > /dev/null && die "tag $tag already exists locally"
+if git rev-parse -q --verify "refs/tags/$tag" > /dev/null; then die "tag $tag already exists locally"; fi
 [ -z "$(git ls-remote --tags origin "refs/tags/$tag")" ] || die "tag $tag already exists on origin"
 
 printf '\n  %s -> %s   (tag %s, commit %s)\n' "$current" "$new" "$tag" "$(git rev-parse --short HEAD)"
 ahead=$(git rev-list --count origin/main..HEAD)
-[ "$ahead" -gt 0 ] && printf '  %s local commit(s) will be pushed to main first\n' "$ahead"
+if [ "$ahead" -gt 0 ]; then
+  printf '  %s local commit(s) will be pushed to main first\n' "$ahead"
+fi
 
 if [ "$dry_run" -eq 0 ] && [ "$assume_yes" -eq 0 ]; then
   [ -t 0 ] || die "refusing to publish without confirmation; pass --yes (or --dry-run)"
@@ -86,7 +92,9 @@ fi
 committed=0
 cleanup() {
   local rc=$?
-  [ $rc -ne 0 ] && [ $committed -eq 0 ] && git checkout -- Cargo.toml Cargo.lock 2> /dev/null
+  if [ $rc -ne 0 ] && [ $committed -eq 0 ]; then
+    git checkout -- Cargo.toml Cargo.lock 2> /dev/null || true
+  fi
   return $rc
 }
 trap cleanup EXIT
@@ -129,11 +137,11 @@ run=""
 for _ in $(seq 1 40); do
   run=$(gh run list --workflow release.yml --limit 20 \
     --json databaseId,headBranch --jq "[.[] | select(.headBranch == \"$tag\")][0].databaseId" 2> /dev/null || true)
-  [ -n "$run" ] && [ "$run" != "null" ] && break
+  if [ -n "$run" ] && [ "$run" != "null" ]; then break; fi
   sleep 3
 done
 [ -n "$run" ] && [ "$run" != "null" ] ||
-  die "no workflow run appeared for $tag; check https://github.com/$(gh repo view --json nameWithOwner --jq .nameWithOwner)/actions"
+  die "no workflow run appeared for $tag; check https://github.com/$repo/actions"
 
 gh run watch "$run" --exit-status --interval 15 > /dev/null ||
   die "the release build failed: $(gh run view "$run" --json url --jq .url)"
@@ -145,12 +153,13 @@ for target in "${TARGETS[@]}"; do
   printf '%s\n' "$assets" | grep -qx "jevgrep-${tag}-${target}.tar.gz" ||
     die "release $tag has no asset for $target"
 done
-[ "$(gh release view "$tag" --json isLatest --jq .isLatest)" = "true" ] ||
-  die "release $tag is not marked as the latest release"
+latest=$(gh api "repos/${repo}/releases/latest" --jq .tag_name 2> /dev/null || true)
+[ "$latest" = "$tag" ] ||
+  die "the latest release is '$latest', not $tag; mise would still serve the old version"
 
 # The end-to-end check users actually run: does mise serve the new version?
 if command -v mise > /dev/null; then
-  got=$(mise exec "github:$(gh repo view --json nameWithOwner --jq .nameWithOwner)@${new}" -- jg --version 2>&1 | tail -1 || true)
+  got=$(mise exec "github:${repo}@${new}" -- jg --version 2>&1 | tail -1 || true)
   if [ "$got" = "jg ${new}" ]; then
     printf '  mise exec ... -- jg --version -> %s\n' "$got"
   else

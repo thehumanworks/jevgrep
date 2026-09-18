@@ -282,6 +282,23 @@ The end-to-end tests run the real binary against a local HTTP server, so they co
 parsing, the HTTP client, retries and rendering together. `JG_BASE_URL` points `jg` at another
 endpoint, `JG_MODEL` at another model, and `JG_NO_FNOX=1` disables the fnox key lookup.
 
+### Releasing
+
+`version` in `Cargo.toml` is the source of truth, and pushing a `vX.Y.Z` tag is what builds and
+publishes the binaries. Cut a release from a clean `main` with:
+
+```bash
+scripts/release.sh patch --dry-run   # bump, test, show the plan, change nothing
+scripts/release.sh minor             # bump, commit, tag, push, wait for the build, verify
+```
+
+The script refuses to run off `main`, with a dirty tree, or on a tag that already exists; after
+the build it checks that all three tarballs are attached, that the release is the latest one, and
+that `mise exec github:thehumanworks/jevgrep@X.Y.Z -- jg --version` prints the new version. `jg`
+is pre-1.0: user-visible changes, including any change to the wording of the questions sent to
+Jev, are a **minor** bump; fixes and internals are a **patch**. `.claude/skills/release/SKILL.md`
+spells the rules out for coding agents.
+
 The benchmark needs the httpx 0.28.1 source in `bench/corpus/httpx` (gitignored):
 `pip install --no-deps --target bench/corpus httpx==0.28.1`. The A/B experiment scripts for
 question wordings and filter templates were written against the Python prototype and live in
