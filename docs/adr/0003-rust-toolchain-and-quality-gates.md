@@ -74,6 +74,9 @@ Native lanes also run the helper suite, including an invocation through system
 `/bin/bash` with no optional build overrides. The first macOS hosted run exposed
 Bash 3.2's empty-array/nounset behavior; keeping a mandatory isolation setting in
 the environment array fixes it without relaxing `set -u` or skipping checks.
+The existing discovery test also canonicalizes its scratch directory so macOS's
+`/var` → `/private/var` alias agrees with `current_dir()`. Its exact relative-path
+assertions remain unchanged; file-discovery implementation is not altered.
 The helper suite covers pin drift, checksum/layout/linkage failures, package-version
 and extracted-binary smoke wiring, installer checksum failure, action pins, publication
 gates, fail-fast behavior, and actual isolated child-process HOME read paths.
