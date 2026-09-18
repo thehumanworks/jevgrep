@@ -3,7 +3,6 @@
 mod common;
 
 use std::path::Path;
-use std::process::Command;
 
 use serde_json::Value;
 
@@ -15,9 +14,10 @@ fn repo(name: &str) -> std::path::PathBuf {
     common::repo(name, &[("db/pool.py", POOL), ("util/strings.py", STRINGS), ("billing/invoice.py", BILLING)])
 }
 
-/// Runs the real binary with the caller's environment (TYPESAFE_API_KEY, or fnox).
+/// Live tests explicitly forward only the caller's API key, not their home/config.
 fn jg(dir: &Path, args: &[&str]) -> common::Ran {
-    common::ran(Command::new(env!("CARGO_BIN_EXE_jg")).current_dir(dir).args(args).env_remove("JG_BASE_URL").output().unwrap())
+    let key = jevgrep::client::resolve_api_key().expect("live tests require TYPESAFE_API_KEY (or fnox)");
+    common::ran(common::command(dir).args(args).env("TYPESAFE_API_KEY", key).output().unwrap())
 }
 
 fn rows(out: &str) -> Vec<Value> {
@@ -130,8 +130,8 @@ fn no_match_exits_1() {
 #[test]
 #[ignore = "hits the real TypeSafe API"]
 fn bad_key_exits_2() {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_jg"));
-    cmd.current_dir(repo("live-badkey")).args(["anything"]).env("TYPESAFE_API_KEY", "apikey_invalid").env_remove("JG_BASE_URL");
+    let mut cmd = common::command(&repo("live-badkey"));
+    cmd.args(["anything"]).env("TYPESAFE_API_KEY", "apikey_invalid");
     let run = common::ran(cmd.output().unwrap());
     assert!(run.code == 2 && run.err.contains("rejected the API key"), "{}", run.err);
 }

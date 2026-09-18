@@ -258,6 +258,8 @@ impl Default for Config {
     }
 }
 
+type DebugReporter = dyn Fn(&str) + Send + Sync;
+
 /// One shared connection pool; safe to call `ask` from many threads.
 pub struct JevClient {
     model: String,
@@ -267,6 +269,7 @@ pub struct JevClient {
     pub usage: Usage,
     pub limiter: AdaptiveLimiter,
     transport: Box<dyn Transport>,
+    debug_reporter: Option<Box<DebugReporter>>,
 }
 
 impl JevClient {
@@ -294,11 +297,20 @@ impl JevClient {
             usage: Usage::default(),
             limiter: AdaptiveLimiter::new(cfg.pool_size, Duration::from_secs(1)),
             transport,
+            debug_reporter: None,
         }
     }
 
-    fn debug(msg: &str) {
-        if std::env::var_os("JG_DEBUG").is_some() {
+    /// Route diagnostic messages through the caller's presentation layer. This
+    /// changes neither retry policy nor request contents; the default retains JG_DEBUG.
+    pub fn set_debug_reporter(&mut self, reporter: impl Fn(&str) + Send + Sync + 'static) {
+        self.debug_reporter = Some(Box::new(reporter));
+    }
+
+    fn debug(&self, msg: &str) {
+        if let Some(reporter) = &self.debug_reporter {
+            reporter(msg);
+        } else if std::env::var_os("JG_DEBUG").is_some() {
             eprintln!("jg[debug]: {msg}");
         }
     }
@@ -326,7 +338,7 @@ impl JevClient {
             let reply = match sent {
                 Ok(reply) => reply,
                 Err(e) => {
-                    Self::debug(&format!("attempt {}: {e}", attempt + 1));
+                    self.debug(&format!("attempt {}: {e}", attempt + 1));
                     last = e;
                     continue;
                 }
@@ -348,7 +360,7 @@ impl JevClient {
             }
             if RETRYABLE.contains(&reply.status) {
                 last = format!("HTTP {}: {text}", reply.status);
-                Self::debug(&format!("attempt {}: {last} retry-after={:?}", attempt + 1, reply.retry_after));
+                self.debug(&format!("attempt {}: {last} retry-after={:?}", attempt + 1, reply.retry_after));
                 if let Some(seconds) = reply.retry_after.and_then(|v| v.trim().parse::<f64>().ok()) {
                     self.sleep(seconds.clamp(0.0, 30.0));
                 }

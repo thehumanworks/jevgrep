@@ -1,7 +1,6 @@
 //! End-to-end: the real `jg` binary against a local fake Jev served over HTTP.
 mod common;
 
-use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -212,8 +211,8 @@ fn rate_limits_are_retried_over_real_http_and_bad_keys_are_not() {
 fn usage_errors_help_and_missing_key() {
     let dir = repo("usage", &[("t.py", "x = 1\n")]);
     let bare = |args: &[&str]| {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_jg"));
-        cmd.current_dir(&dir).args(args).env_remove("TYPESAFE_API_KEY").env("JG_NO_FNOX", "1");
+        let mut cmd = common::command(&dir);
+        cmd.args(args);
         common::ran(cmd.output().unwrap())
     };
     let run = bare(&["q"]);
@@ -228,5 +227,209 @@ fn usage_errors_help_and_missing_key() {
     let run = bare(&["--version"]);
     assert_eq!((run.code, run.out), (0, format!("jg {}\n", env!("CARGO_PKG_VERSION"))));
     let run = bare(&["-h"]);
-    assert!(run.code == 0 && run.out.starts_with("usage: jg") && run.out.contains("--filter TEXT"));
+    assert!(run.code == 0 && run.err.is_empty());
+    assert!(run.out.contains("Usage: jg [OPTIONS] <QUERY> [PATH]...") && run.out.contains("--filter <TEXT>"));
+}
+
+#[test]
+fn baseline_output_fixtures_remain_byte_exact() {
+    let url = needle_server();
+    let dir = repo("fixtures", &[("t.py", "a = 1\nneedle = 2\nb = 3\n")]);
+    let cases: &[(&[&str], &str)] = &[
+        (&["-C1"], include_str!("fixtures/grouped.txt")),
+        (&["--json"], include_str!("fixtures/json.jsonl")),
+        (&["--no-heading"], include_str!("fixtures/flat.txt")),
+        (&["-l"], include_str!("fixtures/files.txt")),
+        (&["-l", "--json"], include_str!("fixtures/files.jsonl")),
+        (&["-e", "another", "-l"], include_str!("fixtures/multi.txt")),
+    ];
+    for (flags, expected) in cases {
+        let mut args = vec!["find needle", "-q"];
+        args.extend(*flags);
+        let run = jg(&dir, &url, &args);
+        assert_eq!((run.code, run.out.as_str(), run.err.as_str()), (0, *expected, ""), "{args:?}");
+    }
+}
+
+#[test]
+fn machine_modes_and_precedence_ignore_all_forced_color_settings() {
+    let url = needle_server();
+    let dir = repo("machine-color", &[("t.py", "a = 1\nneedle = 2\nb = 3\n")]);
+    let cases: &[(&[&str], &str)] = &[
+        (&["--json", "--no-heading"], include_str!("fixtures/json.jsonl")),
+        (&["--no-heading"], include_str!("fixtures/flat.txt")),
+        (&["--files", "--json", "--no-heading"], include_str!("fixtures/files.jsonl")),
+        (&["--files", "--no-heading"], include_str!("fixtures/files.txt")),
+    ];
+    for color in ["auto", "always", "never"] {
+        for (flags, expected) in cases {
+            let output = common::command(&dir)
+                .args(["find needle", "-q", "--color", color])
+                .args(*flags)
+                .env("TERM", "xterm-256color")
+                .env("CLICOLOR_FORCE", "1")
+                .env("TYPESAFE_API_KEY", "test-key")
+                .env("JG_BASE_URL", &url)
+                .output()
+                .unwrap();
+            let run = common::ran(output);
+            assert_eq!((run.code, run.out.as_str(), run.err.as_str()), (0, *expected, ""), "{flags:?}, {color}");
+            assert!(!run.out.contains('\x1b'));
+        }
+    }
+}
+
+#[test]
+fn model_and_endpoint_flags_override_environment_and_empty_model_falls_back() {
+    let dir = repo("environment", &[("t.py", "needle = 2\n")]);
+    for (model_env, flags, expected) in [
+        (None, vec![], "jev-latest"),
+        (Some(""), vec![], "jev-latest"),
+        (Some("environment-model"), vec![], "environment-model"),
+        (Some("environment-model"), vec!["--model", "flag-model"], "flag-model"),
+    ] {
+        let url = serve(move |req| {
+            assert_eq!(req.body["model"], expected);
+            (200, answer_all(&req.body, &["needle"]))
+        });
+        let mut cmd = common::command(&dir);
+        cmd.args(["find needle", "-q"]).args(flags).env("TYPESAFE_API_KEY", "test-key").env("JG_BASE_URL", &url);
+        if let Some(value) = model_env {
+            cmd.env("JG_MODEL", value);
+        }
+        let run = common::ran(cmd.output().unwrap());
+        assert_eq!(run.code, 0, "{}", run.err);
+    }
+    let wrong_calls = Arc::new(AtomicUsize::new(0));
+    let count = wrong_calls.clone();
+    let wrong = serve(move |_| {
+        count.fetch_add(1, Ordering::SeqCst);
+        (401, "{}".into())
+    });
+    let output = common::command(&dir)
+        .args(["find needle", "--base-url", &needle_server(), "-q"])
+        .env("TYPESAFE_API_KEY", "test-key")
+        .env("JG_BASE_URL", wrong)
+        .output()
+        .unwrap();
+    assert_eq!(common::ran(output).code, 0);
+    assert_eq!(wrong_calls.load(Ordering::SeqCst), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn help_version_and_invalid_arguments_never_discover_resolve_keys_or_call_api() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = repo("sentinel", &[("bin/fnox", "#!/bin/sh\nprintf called >> \"$SENTINEL\"\nexit 1\n")]);
+    let sentinel = dir.join("called");
+    std::fs::set_permissions(dir.join("bin/fnox"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = calls.clone();
+    let url = serve(move |_| {
+        count.fetch_add(1, Ordering::SeqCst);
+        (401, "{}".into())
+    });
+    let cases: &[(&[&str], i32)] = &[
+        (&["--help"], 0),
+        (&["-h"], 0),
+        (&["--version"], 0),
+        (&["-V"], 0),
+        (&["q", "no-such-path", "--help"], 0),
+        (&["q", "no-such-path", "--version"], 0),
+        (&[], 2),
+        (&["-e", "extra"], 2),
+        (&["q", "no-such-path", "--bogus"], 2),
+        (&["q", "no-such-path", "--threshold=NaN"], 2),
+        (&["q", "no-such-path", "--file-threshold=inf"], 2),
+        (&["q", "no-such-path", "--jobs=0"], 2),
+        (&["q", "no-such-path", "--chunk-lines=0"], 2),
+    ];
+    for (args, code) in cases {
+        let output = common::command(&dir)
+            .args(*args)
+            .env_remove("JG_NO_FNOX")
+            .env("PATH", dir.join("bin"))
+            .env("SENTINEL", &sentinel)
+            .env("JG_BASE_URL", &url)
+            .env("CLICOLOR_FORCE", "1")
+            .output()
+            .unwrap();
+        let run = common::ran(output);
+        assert_eq!(run.code, *code, "{args:?}: {}", run.err);
+        assert!(!run.err.contains("no such file") && !run.err.contains("TYPESAFE_API_KEY"), "{args:?}: {}", run.err);
+        assert!(!run.out.contains('\x1b') && !run.err.contains('\x1b'));
+        if *code == 0 {
+            assert!(run.err.is_empty() && !run.out.is_empty());
+        } else {
+            assert!(run.out.is_empty() && !run.err.is_empty());
+        }
+        assert!(!sentinel.exists(), "fnox called for {args:?}");
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn color_policy_is_applied_to_human_output_in_child_processes() {
+    let dir = repo("child-color", &[("t.py", "needle = 2\n")]);
+    let url = needle_server();
+    type ColorCase<'a> = (&'a str, &'a [(&'a str, &'a str)], bool);
+    let cases: &[ColorCase<'_>] = &[
+        ("auto", &[], false),
+        ("always", &[("NO_COLOR", "1"), ("TERM", "dumb")], true),
+        ("never", &[("CLICOLOR_FORCE", "1")], false),
+        ("auto", &[("TERM", "xterm"), ("CLICOLOR_FORCE", "1")], true),
+        ("auto", &[("TERM", "xterm"), ("CLICOLOR_FORCE", "1"), ("NO_COLOR", "1")], false),
+        ("auto", &[("TERM", "dumb"), ("CLICOLOR_FORCE", "1")], false),
+        ("auto", &[("TERM", "xterm"), ("CLICOLOR_FORCE", "1"), ("CLICOLOR", "0")], true),
+        ("auto", &[("TERM", "xterm"), ("CLICOLOR_FORCE", "0")], false),
+        ("auto", &[("TERM", "xterm"), ("NO_COLOR", ""), ("CLICOLOR_FORCE", "1")], true),
+    ];
+    for (mode, env, colored) in cases {
+        let run = common::ran(
+            common::command(&dir)
+                .args(["find needle", "-q", "--color", mode])
+                .env("TYPESAFE_API_KEY", "test-key")
+                .env("JG_BASE_URL", &url)
+                .envs(env.iter().copied())
+                .output()
+                .unwrap(),
+        );
+        assert_eq!(run.code, 0, "{}", run.err);
+        assert_eq!(run.out.contains('\x1b'), *colored, "{mode}, {env:?}: {:?}", run.out);
+        assert!(run.err.is_empty());
+    }
+}
+
+#[test]
+fn generated_help_errors_and_version_have_fixed_plain_stream_contracts() {
+    let dir = repo("help-fixtures", &[("unused", "not searched")]);
+    for width in ["20", "100", "200"] {
+        for flag in ["-h", "--help"] {
+            let run = common::ran(
+                common::command(&dir).args(["--color=always", flag]).env("COLUMNS", width).env("CLICOLOR_FORCE", "1").output().unwrap(),
+            );
+            assert_eq!((run.code, run.out.as_str(), run.err.as_str()), (0, include_str!("fixtures/help.txt"), ""));
+        }
+    }
+    for flag in ["-V", "--version"] {
+        let run = common::ran(common::command(&dir).arg(flag).output().unwrap());
+        assert_eq!((run.code, run.out, run.err.as_str()), (0, format!("jg {}\n", env!("CARGO_PKG_VERSION")), ""));
+    }
+    let run = common::ran(common::command(&dir).args(["find", "--bogus"]).output().unwrap());
+    assert_eq!((run.code, run.out.as_str(), run.err.as_str()), (2, "", include_str!("fixtures/error.txt")));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn output_and_flush_failures_are_errors_not_success() {
+    let url = needle_server();
+    let dir = repo("full-writer", &[("t.py", "needle = 2\n")]);
+    for args in [vec!["find needle"], vec!["--help"], vec!["--version"]] {
+        let full = std::fs::OpenOptions::new().write(true).open("/dev/full").unwrap();
+        let run = common::ran(
+            common::command(&dir).args(&args).env("TYPESAFE_API_KEY", "test-key").env("JG_BASE_URL", &url).stdout(full).output().unwrap(),
+        );
+        assert_eq!(run.code, 2, "{args:?}: {}", run.err);
+        assert!(run.err.contains("jg:") && !run.err.contains("tokens"), "{}", run.err);
+    }
 }

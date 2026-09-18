@@ -1,107 +1,70 @@
 name: release
 
-# Builds `jg` for macOS (Apple Silicon) and Linux (x64 + aarch64) and attaches the
-# tarballs to a GitHub release, so users can download a binary or install it with
-# `mise exec github:thehumanworks/jevgrep -- jg --help`.
-#
-# The Linux targets are musl: the binary is fully static, so it runs on any distro
-# regardless of glibc version. TLS roots are compiled in, so nothing else is needed.
-
 on:
   push:
     tags: ["v*"]
-  workflow_dispatch: # build the artifacts without publishing a release
+  workflow_dispatch: # validate artifacts only, including when dispatched on a tag
 
 permissions:
   contents: read
 
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
-  build:
-    name: ${{ matrix.target }}
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: aarch64-apple-darwin
-            runner: macos-15
-          - target: x86_64-unknown-linux-musl
-            runner: ubuntu-24.04
-          - target: aarch64-unknown-linux-musl
-            runner: ubuntu-24.04-arm
-    steps:
-      - uses: actions/checkout@v5
-
-      # ring needs a C compiler that targets musl.
-      - name: Install musl toolchain
-        if: endsWith(matrix.target, '-musl')
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
-
-      - name: Install Rust target
-        run: rustup target add ${{ matrix.target }}
-
-      - name: Build
-        run: cargo build --release --locked --target ${{ matrix.target }}
-
-      - name: Package
-        id: package
-        run: |
-          set -euo pipefail
-          bin="target/${{ matrix.target }}/release/jg"
-          "$bin" --help > /dev/null # smoke test
-          version=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
-          name="jevgrep-v${version}-${{ matrix.target }}"
-          mkdir -p "dist/${name}"
-          cp "$bin" README.md "dist/${name}/"
-          tar -C dist -czf "dist/${name}.tar.gz" "${name}"
-          cd dist
-          if command -v sha256sum > /dev/null; then
-            sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256"
-          else
-            shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256"
-          fi
-          echo "name=${name}" >> "$GITHUB_OUTPUT"
-
-      - uses: actions/upload-artifact@v5
-        with:
-          name: ${{ steps.package.outputs.name }}
-          path: |
-            dist/*.tar.gz
-            dist/*.tar.gz.sha256
-          if-no-files-found: error
+  checks:
+    name: checks
+    uses: ./.github/workflows/checks.yml
 
   release:
     name: publish release
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
+    needs: checks
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v5
-
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1; Node 24
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0; Node 24
+        with:
+          python-version: '3.12'
       - name: Check the tag matches Cargo.toml
+        shell: bash
         run: |
           set -euo pipefail
-          version=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
-          test "v${version}" = "${GITHUB_REF_NAME}" || {
-            echo "tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${version}"
+          version=$(python3 scripts/check-toolchain.py --print-package)
+          test "v${version}" = "$GITHUB_REF_NAME" || {
+            echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $version" >&2
             exit 1
           }
-
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1; Node 24
         with:
+          pattern: jevgrep-v*
           path: dist
           merge-multiple: true
-
+      - name: Verify complete release asset set
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(find dist -type f | wc -l | tr -d ' ')" = 6
+          for target in aarch64-apple-darwin x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+            archive="jevgrep-${GITHUB_REF_NAME}-${target}.tar.gz"
+            test -f "dist/$archive"
+            test -f "dist/$archive.sha256"
+            (cd dist && sha256sum --check "$archive.sha256")
+          done
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
+        shell: bash
         run: |
           set -euo pipefail
-          ls -l dist
-          gh release create "${GITHUB_REF_NAME}" dist/* \
-            --repo "${GITHUB_REPOSITORY}" \
-            --title "${GITHUB_REF_NAME}" \
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
             --latest \
             --generate-notes

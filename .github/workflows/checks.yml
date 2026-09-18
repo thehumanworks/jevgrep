@@ -1,0 +1,118 @@
+name: shared checks
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+# Concurrency belongs to callers. A reusable workflow must not cancel its caller.
+jobs:
+  quality:
+    name: quality
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1; Node 24
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0; Node 24
+        with:
+          python-version: '3.12' # tomllib; never depend on the runner's default Python
+      - name: Assert native runner
+        run: test "$(uname -sm)" = 'Linux x86_64'
+      - name: Install exact project toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          pin=$(python3 scripts/check-toolchain.py --print-rust)
+          rustup toolchain install "$pin" --profile minimal --component rustfmt --component clippy
+      - name: Install checksum-pinned QA tools
+        run: scripts/install-qa-tools.sh
+      - name: Required local and CI checks
+        run: scripts/check.sh
+
+  native:
+    name: native (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-15
+            os: Darwin
+            arch: arm64
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+            os: Linux
+            arch: x86_64
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+            os: Linux
+            arch: aarch64
+    env:
+      TARGET: ${{ matrix.target }}
+      EXPECTED_OS: ${{ matrix.os }}
+      EXPECTED_ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1; Node 24
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0; Node 24
+        with:
+          python-version: '3.12'
+      - name: Assert native runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -s)" = "$EXPECTED_OS"
+          test "$(uname -m)" = "$EXPECTED_ARCH"
+      - name: Install musl C toolchain and ELF inspector
+        if: endsWith(matrix.target, '-musl')
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools binutils
+      - name: Install exact project toolchain and target
+        shell: bash
+        run: |
+          set -euo pipefail
+          pin=$(python3 scripts/check-toolchain.py --print-rust)
+          rustup toolchain install "$pin" --profile minimal --component rustfmt --component clippy --target "$TARGET"
+      - name: Native tests, locked release build, and package
+        run: scripts/check.sh target "$TARGET"
+      - name: Archive name
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(python3 scripts/check-toolchain.py --print-package)
+          echo "name=jevgrep-v${version}-${TARGET}" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1; Node 24
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: |
+            target/dist/*.tar.gz
+            target/dist/*.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 7
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1; Node 24
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: target/downloaded
+      - name: Verify downloaded package and fake API smoke
+        env:
+          PACKAGE: ${{ steps.package.outputs.name }}
+        run: scripts/check.sh verify "target/downloaded/${PACKAGE}.tar.gz" "$TARGET"
+
+  required:
+    name: required checks
+    if: always()
+    needs: [quality, native]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every quality and native package check
+        env:
+          QUALITY: ${{ needs.quality.result }}
+          NATIVE: ${{ needs.native.result }}
+        run: test "$QUALITY" = success && test "$NATIVE" = success

@@ -1,0 +1,2 @@
+usage: jg [options] QUERY [PATH ...]
+jg: error: invalid option '--bogus' (see jg --help)

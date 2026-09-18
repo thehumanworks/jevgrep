@@ -171,16 +171,23 @@ fn token_limit_splits_chunk_and_retries_halves() {
 fn retries_on_429_then_succeeds_and_limiter_recovers() {
     let calls = Arc::new(AtomicUsize::new(0));
     let seen = calls.clone();
-    let c = client(Config { pool_size: 16, ..Config::default() }, move |body| {
+    let mut c = client(Config { pool_size: 16, ..Config::default() }, move |body| {
         if seen.fetch_add(1, Ordering::SeqCst) < 2 {
             status(429, r#"{"detail": {"message": "Rate limit exceeded"}}"#)
         } else {
             ok(answer_all(body, &["needle"]))
         }
     });
+    let messages = Arc::new(Mutex::new(Vec::new()));
+    let reported = Arc::clone(&messages);
+    c.set_debug_reporter(move |message| reported.lock().unwrap().push(message.to_owned()));
     let chunk = &chunk_lines("a.py", &["needle"], Chunking::default())[0];
     let (state, questions) = build_request(&queries(&["q"]), chunk, false, false, None);
     let answers = c.ask(&state, &questions).unwrap();
+    let messages = messages.lock().unwrap();
+    assert_eq!(messages.len(), 2);
+    assert!(messages[0].starts_with("attempt 1:") && messages[1].starts_with("attempt 2:"));
+    assert!(messages.iter().all(|message| message.contains("429")));
     assert_eq!(answers["q0.L1"]["noul"], 0.95);
     assert_eq!((c.usage.retries(), c.usage.requests(), calls.load(Ordering::SeqCst)), (2, 1, 3));
     assert!(c.limiter.limit() < 16.0 && c.limiter.in_flight() == 0);
@@ -237,7 +244,11 @@ fn a_search_where_every_request_fails_is_an_error_and_a_partial_one_is_noted() {
         }
     });
     let mut notes = Vec::new();
-    let res = search(&c, &queries(&["q"]), &files, &Options::default(), |_, _| {}, |n| notes.push(n.to_owned())).unwrap();
+    let mut progress = Vec::new();
+    let res =
+        search(&c, &queries(&["q"]), &files, &Options::default(), |done, total| progress.push((done, total)), |n| notes.push(n.to_owned()))
+            .unwrap();
+    assert_eq!(progress, [(1, 2), (2, 2)]);
     assert!(res[0].len() == 1 && res[0][0].path.ends_with("a.py"));
     assert!(notes[0].starts_with("1 request(s) failed, results may be incomplete; first error: HTTP 422"), "{notes:?}");
 }

@@ -1,0 +1,75 @@
+usage: jg [options] QUERY [PATH ...]
+
+jevgrep: search code with a natural-language query. Every file chunk is scored line by line by
+TypeSafe's Jev model, in parallel.
+
+arguments:
+  QUERY                   what you are looking for, in plain language
+  PATH                    files or directories (default: .)
+
+options:
+  -e, --query QUERY       additional query answered in the same pass (repeatable)
+  -l, --files             rank relevant files only, no region or line scoring (about 3x cheaper)
+  -f, --filter TEXT       plain-language include/exclude rules, e.g. "Source code only. No tests or
+                          documentation" (repeatable)
+      --only CATEGORY     keep only code in this category, e.g. --only "async code" (repeatable: all must hold)
+      --not CATEGORY      drop code in this category, e.g. --not tests --not "generated code" (repeatable)
+  -b, --broad             flag every line related to the query, not just the lines that answer it
+                          (more recall, more noise)
+  -t, --threshold P       min probability for a region or line to count as a match (default 0.5)
+  -T, --file-threshold P  file relevance needed to list a file with -l, or to put a file with nothing
+                          above -t into the weaker tier (default 0.6)
+  -n, --top N             max files per query (default 15)
+  -m, --max-lines N       max pinpointed lines per file (default 10)
+      --max-regions N     max regions per file (default 5)
+  -C, --context N         lines of context around each pinpointed line
+  -g, --glob GLOB         only search files matching GLOB (repeatable)
+  -x, --exclude GLOB      skip files matching GLOB (repeatable)
+  -j, --jobs N            concurrent Jev requests (default 32)
+      --json              JSON lines, one object per matching file
+      --no-heading        flat output: path:START-END:prob:label for regions, path:LINE:prob:text for
+                          lines; matches only, no weaker tier
+      --triage            pre-filter files by path with Jev first (automatic above --max-files)
+      --max-files N       file cap before path triage kicks in (default 1500)
+      --max-filesize BYTES  skip files larger than BYTES (default 512000)
+      --chunk-lines N     lines per Jev request (default 150)
+      --hidden            include dotfiles
+      --no-ignore         do not honor .gitignore
+  -q, --quiet             no progress or stats on stderr
+      --model MODEL       Jev model (default jev-latest, or $JG_MODEL)
+      --base-url URL      API endpoint (default TypeSafe's, or $JG_BASE_URL)
+  -V, --version           print the version
+  -h, --help              print this help
+
+environment:
+  TYPESAFE_API_KEY        API key. When unset, jg tries `fnox get TYPESAFE_API_KEY`.
+
+examples:
+  jg "where are retries and backoff handled for HTTP requests"
+  jg "how is the session cookie validated" src/ -g "*.ts"
+  jg -l "database migration logic"                 # rank files only (cheapest)
+  jg "auth token refresh" -e "rate limiting" -e "where config is loaded"   # several queries, one pass
+  jg --json "where is the retry budget set" | jq .
+  jg "where are requests retried" --filter "Source code only. No tests or documentation"
+  jg "where is the timeout set" --not tests --not "command line interface"
+
+filters:
+  --filter takes plain language. jg splits it into categories and asks Jev one positive question
+  per category ("does this fall under the category: tests?"), then applies only/not in code,
+  because Jev answers atomic yes/no questions far more reliably than negated or compound rules.
+  Name kinds of thing: "tests", "documentation", "imports", "generated code", "async code".
+  Categories can describe files (tests, docs) or code inside them (imports, comments).
+  --only / --not skip the parsing and take one category each. jg prints how it read the filter.
+  For rules a glob can express (file extensions, directories) use -g / -x: exact, free, faster.
+
+output, one row shape throughout (location, probability, text):
+  src/http/client.py  relevance=0.96        file; files are sorted by this number
+      494-508  0.96  def _redirect_method(  region: P(these lines contain what you are looking for)
+          502  0.93      method = "GET"     line:   P(this line directly answers the query)
+
+Only rows that clear -t are printed, and no source line is printed twice. A line can clear -t
+when its surrounding block does not; it is then listed on its own, without a region row. A broad
+query ("how does auth work") has no single answering line, so it returns regions only. Files that
+look related overall but hold nothing above -t are listed last, under a "weaker" separator, and
+only with near misses (at least 0.7 x -t). Probabilities are calibrated: 0.9 means right about 9
+times in 10. Raise -t for precision, lower it for recall. Exit status: 0 matches found, 1 none, 2 error.

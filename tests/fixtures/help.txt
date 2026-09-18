@@ -1,0 +1,90 @@
+jevgrep: search code with a natural-language query. Every file chunk is scored line by line by
+TypeSafe's Jev model, in parallel.
+
+Usage: jg [OPTIONS] <QUERY> [PATH]...
+
+Arguments:
+  <QUERY>    What you are looking for, in plain language
+  [PATH]...  Files or directories (default: .)
+
+Options:
+  -e, --query <QUERY>         Additional query answered in the same pass (repeatable)
+  -l, --files                 Rank relevant files only, no region or line scoring (about 3x cheaper)
+  -f, --filter <TEXT>         Plain-language include/exclude rules, e.g. "Source code only. No
+                              tests" (repeatable)
+      --only <CATEGORY>       Keep only code in this category (repeatable: all must hold)
+      --not <CATEGORY>        Drop code in this category, e.g. --not tests (repeatable)
+  -b, --broad                 Flag every line related to the query, not just answers (more recall,
+                              more noise)
+  -t, --threshold <P>         Min probability for a region or line to count as a match [default:
+                              0.5]
+  -T, --file-threshold <P>    File relevance needed for -l or the weaker tier when nothing clears -t
+                              [default: 0.6]
+  -n, --top <N>               Max files per query [default: 15]
+  -m, --max-lines <N>         Max pinpointed lines per file [default: 10]
+      --max-regions <N>       Max regions per file [default: 5]
+  -C, --context <N>           Lines of context around each pinpointed line [default: 0]
+  -g, --glob <GLOB>           Only search files matching GLOB (repeatable)
+  -x, --exclude <GLOB>        Skip files matching GLOB (repeatable)
+  -j, --jobs <N>              Concurrent Jev requests [default: 32]
+      --json                  JSON lines, one object per matching file
+      --no-heading            Flat output: path:START-END:prob:label or path:LINE:prob:text; no
+                              weaker tier
+      --triage                Pre-filter files by path with Jev first (automatic above --max-files)
+      --max-files <N>         File cap before path triage kicks in [default: 1500]
+      --max-filesize <BYTES>  Skip files larger than BYTES [default: 512000]
+      --chunk-lines <N>       Lines per Jev request [default: 150]
+      --hidden                Include dotfiles
+      --no-ignore             Do not honor .gitignore
+  -q, --quiet                 No progress or stats on stderr
+      --model <MODEL>         Jev model (default: jev-latest, or $JG_MODEL)
+      --base-url <URL>        API endpoint (default: https://api.typesafe.ai/v1/systemone, or
+                              $JG_BASE_URL)
+      --color <WHEN>          Color eligible human output; JSON, flat output, help and usage errors
+                              remain plain [default: auto] [possible values: auto, always, never]
+  -h, --help                  Print help
+  -V, --version               Print version
+
+environment:
+  TYPESAFE_API_KEY        API key. When unset, jg tries `fnox get TYPESAFE_API_KEY`.
+  JG_NO_FNOX             When set, disable the fnox key lookup.
+  JG_MODEL               Model when --model is absent; empty means the default.
+  JG_BASE_URL            Endpoint when --base-url is absent; empty means the default.
+  JG_DEBUG               When set, log retry reasons.
+  NO_COLOR               Nonempty disables application styling in auto mode.
+  TERM=dumb              Disables application styling in auto mode and progress.
+  CLICOLOR_FORCE         Nonempty and not 0 forces auto styling unless disabled above.
+  CLICOLOR=0             Disables auto styling unless CLICOLOR_FORCE enables it.
+  --color always/never   Overrides color environment settings for human output only.
+                         JSON, flat output, help and usage errors remain plain.
+
+examples:
+  jg "where are retries and backoff handled for HTTP requests"
+  jg "how is the session cookie validated" src/ -g "*.ts"
+  jg -l "database migration logic"                 # rank files only (cheapest)
+  jg "auth token refresh" -e "rate limiting" -e "where config is loaded"
+  jg --json "where is the retry budget set" | jq .
+  jg "where are requests retried" --filter "Source code only. No tests or documentation"
+  jg "where is the timeout set" --not tests --not "command line interface"
+
+filters:
+  --filter takes plain language. jg splits it into categories and asks Jev one positive question
+  per category ("does this fall under the category: tests?"), then applies only/not in code,
+  because Jev answers atomic yes/no questions far more reliably than negated or compound rules.
+  Name kinds of thing: "tests", "documentation", "imports", "generated code", "async code".
+  Categories can describe files (tests, docs) or code inside them (imports, comments).
+  --only / --not skip the parsing and take one category each. jg prints how it read the filter.
+  For rules a glob can express (file extensions, directories) use -g / -x: exact, free, faster.
+
+output, one row shape throughout (location, probability, text):
+  src/http/client.py  relevance=0.96        file; files are sorted by this number
+      494-508  0.96  def _redirect_method(  region: P(these lines contain what you are looking for)
+          502  0.93      method = "GET"     line:   P(this line directly answers the query)
+
+Only rows that clear -t are printed, and no source line is printed twice. A line can clear -t
+when its surrounding block does not; it is then listed on its own, without a region row. A broad
+query ("how does auth work") has no single answering line, so it returns regions only. Files that
+look related overall but hold nothing above -t are listed last, under a "weaker" separator, and
+only with near misses (at least 0.7 x -t). Probabilities are calibrated: 0.9 means right about 9
+times in 10. Raise -t for precision, lower it for recall. Exit status: 0 matches found, 1 none, 2
+error.

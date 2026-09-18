@@ -1,0 +1,1 @@
+{"query":"find needle","path":"t.py","relevance":1.0,"section_relevance":1.0,"confidence":0.9,"match":"strong","regions":[{"start":1,"end":3,"p":0.9,"label":"a = 1","label_line":1,"lines":[{"line":2,"p":0.95,"text":"needle = 2"}]}],"lines":[],"more_regions":0,"more_lines":0}

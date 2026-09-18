@@ -110,10 +110,31 @@ pub struct Ran {
     pub err: String,
 }
 
+/// A child with no access to user application configuration or credentials.
+/// These deliberately nonexistent directories are outside the searched fixture repo.
+pub fn command(dir: &Path) -> Command {
+    let home = std::env::temp_dir().join(format!("jg-isolated-home-{}", std::process::id()));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_jg"));
+    cmd.current_dir(dir)
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("XDG_CACHE_HOME", home.join("cache"))
+        .env("XDG_DATA_HOME", home.join("data"))
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("JG_NO_FNOX", "1")
+        .env("LC_ALL", "C")
+        .env("TERM", "dumb")
+        .env("COLUMNS", "100");
+    cmd
+}
+
 /// Runs the real `jg` binary in `dir` against `base_url` with a test key.
 pub fn jg(dir: &Path, base_url: &str, args: &[&str]) -> Ran {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_jg"));
-    cmd.current_dir(dir).args(args).env("TYPESAFE_API_KEY", "test-key").env("JG_BASE_URL", base_url).env_remove("JG_MODEL");
+    let mut cmd = command(dir);
+    cmd.args(args).env("TYPESAFE_API_KEY", "test-key").env("JG_BASE_URL", base_url);
     ran(cmd.output().unwrap())
 }
 
