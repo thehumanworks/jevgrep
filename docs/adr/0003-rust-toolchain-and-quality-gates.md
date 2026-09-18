@@ -29,7 +29,13 @@ fake-API/PTY harness against the host release binary.
 
 Share quality and native release-target jobs through `checks.yml`, called by thin
 CI and release workflows. Build Apple Silicon Darwin, x86_64 musl, and aarch64 musl
-with `--locked`; assert each runner's actual architecture. Keep existing tarball
+with `--locked`; assert each runner's actual architecture. Use native `macos-26`
+(ARM64), `ubuntu-24.04` (x86_64), and `ubuntu-24.04-arm` (aarch64) runners.
+GitHub's current runner documentation and ARM64 image manifest confirm the Darwin
+mapping. The original `macos-15` label stayed queued without an assigned runner for
+ten minutes during verification, so it was replaced by the supported, explicit
+`macos-26` label rather than a floating `macos-latest`. Targets and archive names
+are unchanged. Keep existing tarball
 names, README layout, and SHA256 sidecars. Download artifacts before checking
 checksums, extraction, help/version, fake-API smoke, and Linux static linkage.
 Use reviewed immutable external action commits with Node 24 or newer, bounded
