@@ -126,7 +126,10 @@ fn scratch(name: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("jg-test-{}-{name}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
-    dir
+    // macOS TMPDIR can use /var while current_dir() resolves /private/var.
+    // This fixture must use the same physical path as cwd for the absolute-path
+    // assertion below; keep the relative display-path assertion unchanged.
+    dir.canonicalize().unwrap()
 }
 
 fn write(root: &Path, rel: &str, data: &[u8]) {

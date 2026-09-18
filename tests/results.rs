@@ -254,3 +254,13 @@ fn region_label_names_the_enclosing_definition_for_mid_function_blocks() {
     assert_eq!(region_label(decorated, 1, 3), ("def size(self):".to_string(), 2));
     // label line is the def, not the decorator
 }
+
+#[test]
+fn zero_display_caps_retain_existing_selection_semantics() {
+    let fr = file("a.py", 0.9, &[(1, 3, 0.8)], &[(2, 0.9)]);
+    assert!(jevgrep::results::select(std::slice::from_ref(&fr), &Limits { top: 0, ..Limits::default() }).is_empty());
+    assert!(select_files(std::slice::from_ref(&fr), 0.0, 0).is_empty());
+    let view = jevgrep::results::view_file(&fr, &Limits { max_regions: 0, max_lines: 0, ..Limits::default() }).unwrap();
+    assert!(view.regions.is_empty() && view.lines.is_empty());
+    assert_eq!((view.more_regions, view.more_lines, view.weak), (1, 0, false));
+}

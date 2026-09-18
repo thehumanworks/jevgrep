@@ -1,0 +1,3 @@
+# Exact grouped-output fixtures intentionally include the final separator line.
+tests/fixtures/grouped.txt whitespace=-blank-at-eof
+tests/fixtures/multi.txt whitespace=-blank-at-eof
