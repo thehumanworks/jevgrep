@@ -1,6 +1,6 @@
 [package]
 name = "jevgrep"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.98.1"
 description = "jg: natural-language code search with Jev, ChatGPT and OpenAI-compatible decision backends"
