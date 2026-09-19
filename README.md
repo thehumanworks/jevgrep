@@ -496,8 +496,9 @@ The script refuses to run off `main`, with a dirty tree, or on a tag that alread
 the build it checks that all three tarballs are attached, that the release is the latest one, and
 that `mise exec github:thehumanworks/jevgrep@X.Y.Z -- jg --version` prints the new version. `jg`
 is pre-1.0: user-visible changes, including any change to the wording of the questions sent to
-Jev, are a **minor** bump; fixes and internals are a **patch**. `.claude/skills/release/SKILL.md`
-spells the rules out for coding agents.
+Jev, are a **minor** bump; fixes and internals are a **patch**. Releases are cut by a coding
+agent, not by hand: [`AGENTS.md`](AGENTS.md) says so and `.claude/skills/release/SKILL.md` spells
+out the rules.
 
 The benchmark needs the httpx 0.28.1 source in `bench/corpus/httpx` (gitignored):
 `pip install --no-deps --target bench/corpus httpx==0.28.1`. The A/B experiment scripts for
