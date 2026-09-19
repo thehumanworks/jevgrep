@@ -18,7 +18,7 @@ use crate::chatgpt_auth::{device_login, resolve_credentials};
 use crate::client::{resolve_api_key, Config, JevClient, JevError};
 use crate::files::{discover, Discover};
 use crate::filters::{parse_filter, Rules};
-use crate::openai_compat::{ChatClient, ChatConfig};
+use crate::openai::{evaluation_url, label, resolve_key, OpenAiClient, OpenAiConfig, OPENAI_KEY_VAR};
 use crate::results::{filtered_out, select, select_files, Limits};
 use crate::search::{search, Options};
 use progress::Progress;
@@ -151,10 +151,10 @@ fn execute(args: &Args, out: &mut dyn Write) -> io::Result<i32> {
             return Ok(2);
         }
         Err(e) => {
-            let provider = match (args.backend, args.backend.provider()) {
-                (_, Some(provider)) => provider.label(&args.base_url),
-                (BackendKind::Chatgpt, None) => "ChatGPT".to_owned(),
-                (_, None) => "TypeSafe".to_owned(),
+            let provider = match args.backend {
+                BackendKind::Jev => "TypeSafe".to_owned(),
+                BackendKind::Chatgpt => "ChatGPT".to_owned(),
+                BackendKind::Openai => label(&args.base_url),
             };
             eprintln!("jg: {}", diagnostics.notice(format!("{provider} API error: {e}")));
             return Ok(2);
@@ -223,7 +223,7 @@ fn execute(args: &Args, out: &mut dyn Write) -> io::Result<i32> {
                 client.service_tier().as_deref().unwrap_or("unreported"),
                 started.elapsed().as_secs_f64()
             ),
-            BackendKind::Openrouter | BackendKind::Openai => {
+            BackendKind::Openai => {
                 // A cost is shown only where the service states one; jg knows no price list.
                 let cost = client.reported_cost_usd().map(|usd| format!("; reported cost ${usd:.4}")).unwrap_or_default();
                 eprintln!(
@@ -232,7 +232,7 @@ fn execute(args: &Args, out: &mut dyn Write) -> io::Result<i32> {
                     usage.requests(),
                     thousands(usage.input_tokens()),
                     thousands(usage.output_tokens()),
-                    args.backend.provider().map(|provider| provider.label(&args.base_url)).unwrap_or_default(),
+                    label(&args.base_url),
                     args.model,
                     started.elapsed().as_secs_f64()
                 )
@@ -266,23 +266,39 @@ fn build_backend(args: &Args, progress: &Arc<Progress>) -> Result<Box<dyn Decisi
             }
             Ok(Box::new(client))
         }
-        BackendKind::Openrouter | BackendKind::Openai => {
-            let provider = args.backend.provider().expect("every OpenAI-compatible backend has a preset");
-            let key = provider.resolve_key(
-                &args.base_url,
-                args.api_key.as_ref().map(|key| key.0.as_str()),
-                args.api_key_env.as_deref(),
-                |name| std::env::var(name).ok(),
-            )?;
-            let cfg = ChatConfig {
+        BackendKind::Openai => {
+            let key = resolve_key(&args.base_url, args.api_key.as_ref().map(|key| key.0.as_str()), |name| std::env::var(name).ok())?;
+            // Jev behind a gateway is still Jev: same questions, same answers, same client.
+            if let Some(url) = evaluation_url(&args.base_url, &args.model) {
+                let key = key.ok_or_else(|| JevError::Auth(format!("{OPENAI_KEY_VAR} is not set. Export it, or pass --api-key <KEY>.")))?;
+                let cfg = Config {
+                    base_url: url.to_owned(),
+                    model: args.model.clone(),
+                    provider: label(&args.base_url),
+                    // Measured live, the gateway answers 503 "try again shortly" at once, to an
+                    // eighth of small requests and half of large ones whatever the concurrency, so
+                    // a retry is soon and often: waiting longer only made one unlucky request the
+                    // whole search's tail.
+                    max_retries: 16,
+                    max_backoff: 2.0,
+                    pool_size: args.jobs.max(8),
+                    ..Config::default()
+                };
+                let mut client = JevClient::new(&key, cfg);
+                if debug {
+                    client.set_debug_reporter(reporter);
+                }
+                return Ok(Box::new(client));
+            }
+            let cfg = OpenAiConfig {
                 base_url: args.base_url.clone(),
                 model: args.model.clone(),
-                json_schema: args.json_schema,
+                json_schema: !args.no_schema,
                 extra_body: args.extra_body.clone(),
                 pool_size: args.jobs,
-                ..ChatConfig::new(provider)
+                ..OpenAiConfig::default()
             };
-            let mut client = ChatClient::new(key.as_deref(), cfg);
+            let mut client = OpenAiClient::new(key.as_deref(), cfg);
             if debug {
                 client.set_debug_reporter(reporter);
             }

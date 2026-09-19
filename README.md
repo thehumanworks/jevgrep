@@ -16,15 +16,15 @@ directly to `https://chatgpt.com/backend-api/codex/responses` with fixed model `
 That path is not Codex inference. ChatGPT scores use the same grep JSON/text schema as Jev, but
 they are generative relevance estimates, not empirically calibrated probabilities.
 
-`--backend openai` sends the same questions to any OpenAI-compatible chat-completions API:
-api.openai.com by default, or with `--base-url` any hosted service or local server that speaks the
-protocol (Groq, Together, DeepSeek, Mistral, vLLM, llama.cpp, Ollama, LM Studio, a corporate
-gateway). `--backend openrouter` is a preset of the same client for [OpenRouter](https://openrouter.ai),
-with `inclusionai/ling-3.0-flash-fin:free` as its default model. These scores are model estimates
-too.
+`--backend openai` sends the same questions to any OpenAI-compatible service, configured the way
+OpenAI's own SDKs are: `OPENAI_API_KEY` and `OPENAI_BASE_URL`. api.openai.com is the default, and
+[OpenRouter](https://openrouter.ai), Groq, a corporate gateway, vLLM, llama.cpp, Ollama or LM
+Studio are each just a base URL, a key (or none) and a model. `jg` prefers the Responses API with
+structured outputs and falls back by itself where a service lacks them. These scores are model
+estimates too.
 
 `jg` is a single native binary written in Rust, with no runtime to install. The Linux GNU
-host release build with all backends is about 3.3 MB (3,332,512 bytes).
+host release build with all backends is about 3.3 MB (3,334,600 bytes).
 Its only dynamic dependencies are libc and libgcc, and TLS roots are compiled in.
 
 ```console
@@ -39,7 +39,7 @@ jg: 23 files, 72 requests, 301,208 tokens (~$0.0127), 2.2s
 
 Jev stats include a token dollar estimate. ChatGPT subscription stats do not: they report
 input and output tokens, that priority was requested, and the tier the server actually served.
-OpenAI-compatible stats report input and output tokens, the service and model, and a cost only
+`openai` stats report input and output tokens, the service's host and the model, and a cost only
 where the service itself states one, as OpenRouter does (`$0.0000` on a free model).
 
 ## Reading the output
@@ -192,21 +192,33 @@ login) and continues the search. A stale Codex cache fails at the server with an
 `--chatgpt-login` hint. Live protocol notes and QA evidence live in
 [docs/chatgpt-verification.md](docs/chatgpt-verification.md).
 
-The OpenAI-compatible backends look for a key in exactly three places, in order: `--api-key KEY`,
-the variable named by `--api-key-env VAR`, then the preset's own variable (`OPENROUTER_API_KEY`
-for `openrouter`, `OPENAI_API_KEY` for `openai`). They never run `fnox` or any other secret
-manager themselves; to take a key from one, wrap the call, e.g.
-`fnox run -- jg --backend openrouter "<query>"`. Prefer a variable: a key passed as `--api-key` is
-visible to other users in `ps`. As with OpenAI's SDKs, `OPENAI_API_KEY` is sent to whatever base
-URL `--backend openai` is given, so name another service's key with `--api-key-env`. `openai` with
-a base URL of its own may go without a key, as local servers do. A key is only ever sent over
-HTTPS, or HTTP on localhost.
+The `openai` backend is configured like an OpenAI SDK:
 
 ```bash
-jg --backend openai --model MODEL "<query>"                                  # api.openai.com, OPENAI_API_KEY
+export OPENAI_API_KEY=...                                   # or --api-key KEY
+export OPENAI_BASE_URL=https://openrouter.ai/api/v1         # or --base-url; default https://api.openai.com/v1
+jg --backend openai --model VENDOR/MODEL "<query>"          # --model or $JG_MODEL is required
+
 jg --backend openai --base-url http://localhost:11434/v1 --model MODEL -j 2 "<query>"   # local, keyless
-jg --backend openai --base-url https://api.example.com/v1 --api-key-env EXAMPLE_API_KEY \
-   --model MODEL --extra-body '{"reasoning_effort":"low"}' "<query>"
+fnox run -- sh -c 'OPENAI_API_KEY=$OPENROUTER_API_KEY jg --backend openai --model MODEL "<query>"'
+```
+
+The key is `--api-key`, else `OPENAI_API_KEY`, and nothing else: `jg` never runs `fnox` or any
+other secret manager for it, though you can wrap the call in one as above. Prefer the variable: a
+key passed as `--api-key` is visible to other users in `ps`. As with OpenAI's SDKs, the key is sent
+to whatever base URL is configured. api.openai.com requires one; any other base URL may go without,
+as local servers do. A key is only ever sent over HTTPS, or HTTP on localhost. There is no default
+model: names differ between services and go stale.
+
+[Vercel AI Gateway](https://vercel.com/docs/ai-gateway) also lists Jev itself, as
+`typesafe-ai/jev`, but [not behind its OpenAI-compatible routes](https://vercel.com/docs/ai-gateway/modalities/evaluation).
+With that base URL and model, `jg` asks Jev on the gateway's
+[TypeSafe-compatible route](https://vercel.com/docs/ai-gateway/sdks-and-apis/typesafe) with the
+same key, so the scores are Jev's own calibrated ones, billed through the gateway:
+
+```bash
+export OPENAI_API_KEY=$AI_GATEWAY_API_KEY OPENAI_BASE_URL=https://ai-gateway.vercel.sh/v1
+jg --backend openai --model typesafe-ai/jev "<query>"
 ```
 
 ## Usage
@@ -231,14 +243,13 @@ jg QUERY [PATH ...]
 | `--no-heading` | flat rows: `path:START-END:prob:label` for regions, `path:LINE:prob:text` for lines; matches only |
 | `--triage` | pre-filter files by path first; automatic above `--max-files` (1500) |
 | `-j N` | concurrent requests (must be positive; default 32). On ChatGPT a search with fewer chunks than lanes is cut into smaller requests to fill them |
-| `--backend jev\|chatgpt\|openrouter\|openai` | decision backend; default `jev`, or `$JG_BACKEND`. `openai` is any OpenAI-compatible API; `openrouter` is a preset of it |
+| `--backend jev\|chatgpt\|openai` | decision backend; default `jev`, or `$JG_BACKEND`. `openai` is any OpenAI-compatible service |
 | `--chatgpt-login` | ChatGPT only: run Codex device login, then search; requires a query |
-| `--api-key KEY` | OpenAI-compatible only: API key; default the preset's variable (`$OPENROUTER_API_KEY`, `$OPENAI_API_KEY`) |
-| `--api-key-env VAR` | OpenAI-compatible only: read the key from `$VAR` instead; excludes `--api-key` |
-| `--json-schema` | OpenAI-compatible only: send the strict response schema. For models with structured outputs; others may reject the request |
-| `--extra-body JSON` | OpenAI-compatible only: request fields to add or override, or `$JG_EXTRA_BODY`; `null` removes a field; `messages` and `stream` are refused |
-| `--model MODEL` | model, or `$JG_MODEL`. Jev: `jev-latest`. `openrouter`: any model id, default `inclusionai/ling-3.0-flash-fin:free`. `openai`: required, no default. ChatGPT is `gpt-5.6-luna` only; any other `--model` or `$JG_MODEL` is an error unless `--model gpt-5.6-luna` overrides |
-| `--base-url URL` | override the selected backend endpoint, or `$JG_BASE_URL`; `openai` also honours `$OPENAI_BASE_URL`. The OpenAI-compatible backends take an API root (`https://host/v1`) or the full `/chat/completions` URL. ChatGPT and keyed OpenAI-compatible requests accept HTTPS, or HTTP on `localhost` / `127.0.0.1` / `::1`, and do not follow redirects |
+| `--api-key KEY` | `openai` only: API key; default `$OPENAI_API_KEY` |
+| `--no-schema` | `openai` only: do not ask for structured outputs. `jg` finds this out by itself at the cost of one refused request per concurrent first request; the flag saves those for a model known to lack them |
+| `--extra-body JSON` | `openai` only: request fields to add or override, or `$JG_EXTRA_BODY`; `null` removes a field; `input`, `messages` and `stream` are refused |
+| `--model MODEL` | model, or `$JG_MODEL`. Jev: `jev-latest`. `openai`: required, no default. ChatGPT is `gpt-5.6-luna` only; any other `--model` or `$JG_MODEL` is an error unless `--model gpt-5.6-luna` overrides |
+| `--base-url URL` | override the selected backend endpoint, or `$JG_BASE_URL`; `openai` then honours `$OPENAI_BASE_URL`. For `openai` it is an API root (`https://host/v1`), or a full `/responses` or `/chat/completions` URL to settle which API is spoken. ChatGPT and keyed `openai` requests accept HTTPS, or HTTP on `localhost` / `127.0.0.1` / `::1`, and do not follow redirects |
 | `--color auto\|always\|never` | styling for human output; default `auto` |
 
 Exit status follows grep: `0` matches, `1` none, `2` error. Results go to stdout; progress and the
@@ -277,8 +288,7 @@ Explicit `--backend` overrides `JG_BACKEND`; unset or empty environment values u
 Explicit `--model`/`--base-url` overrides `JG_MODEL`/`JG_BASE_URL`; unset or empty environment
 values use the selected backend's default. API-key/fnox and ChatGPT credential resolution
 remain outside parsing. `--chatgpt-login` without a ChatGPT backend is a usage error, and so are
-`--api-key`, `--api-key-env`, `--json-schema` and `--extra-body` without an OpenAI-compatible
-backend. `JG_MODEL` applies to whichever backend is selected.
+`--api-key`, `--no-schema` and `--extra-body` without `--backend openai`. `JG_MODEL` applies to whichever backend is selected.
 
 ## For coding agents
 
@@ -289,7 +299,7 @@ Paste this into `CLAUDE.md` or `AGENTS.md`:
 Use `jg "<question>" [path]` when you know what you are looking for but not what it is called.
 Rows are `location  probability  text`. A range like `494-508` is a region to Read; a single
 number is a line that directly answers the query. Jev probabilities are calibrated; ChatGPT
-(`--backend chatgpt`) and OpenAI-compatible (`--backend openrouter`, `--backend openai`) scores
+(`--backend chatgpt`) and OpenAI-compatible (`--backend openai`) scores
 are uncalibrated estimates with the same output schema.
 - Every row above the `-- weaker` separator cleared the threshold on its own. Rows below it are near misses; ignore them unless the matches above are not enough.
 - Ask several things at once: `jg "q1" -e "q2" -e "q3"`. One pass, shared cost.
@@ -323,16 +333,16 @@ every thread pauses briefly and concurrency halves, then grows back on success.
    Jev-shaped answer is rebuilt locally), reasoning effort is `low`, and a search too small to
    fill `-j` lanes is split into finer chunks, down to a quarter of `--chunk-lines`.
    An OpenAI-compatible service gets the same state, questions and terse reply format as one
-   chat completion carrying only what every such service accepts: `model`, `messages` and
-   `temperature: 0`. What differs between services is data, not code: a preset adds the request
-   fields only its service understands (OpenRouter: reasoning kept on but off the wire, usage
-   accounting), and `--extra-body` passes any other knob through. No response schema is sent
-   unless `--json-schema` asks for it: most models cannot enforce one, and the OpenRouter default
-   model's provider answers HTTP 400 to the attempt. The reply format is written into the
-   instructions instead and every reply passes the same local checks; one that fails them is
-   asked for again at a higher temperature, at most twice. A model that refuses `temperature` is
-   asked again without it, once per run. Chunks are never split finer to fill lanes: hosted
-   services ration requests (OpenRouter free models: 20 a minute, 50 or 1000 a day).
+   Responses API request with structured outputs: `instructions`, `input`, `store: false`,
+   `temperature: 0`, and a strict JSON schema that admits exactly the answers asked for. Only the
+   API's common core is sent, and `--extra-body` passes any service's own knobs through. The
+   client then adapts, once per run, to what a service refuses: no `/responses` route, chat
+   completions instead; no structured outputs, no schema (a live probe of a model without them
+   came back HTTP 400 rather than being served without); no `temperature`, none sent. The reply
+   format is also written into the instructions, and every reply passes the same local checks
+   with or without a schema; one that fails them is asked for again at a higher temperature, at
+   most twice. Chunks are never split finer to fill lanes: hosted services ration requests (free
+   models on OpenRouter: 20 a minute, 50 or 1000 a day).
 4. **Select** what to show with the rules in `src/results.rs`: a row is printed only if
    its own probability clears `-t`; no source line appears twice; every shown file carries a
    location; matches come before near misses.
@@ -350,7 +360,7 @@ exponential backoff and jitter.
 | `src/client.rs` | Jev HTTP client, retries, adaptive rate limiting |
 | `src/answers.rs` | what a text model needs to answer like Jev: terse wire ids, response schema, reply validation |
 | `src/chatgpt.rs` | ChatGPT Responses client: `gpt-5.6-luna`, requested `priority`, SSE assembly |
-| `src/openai_compat.rs` | one chat-completions client for any OpenAI-compatible API; `Provider` presets (`OPENROUTER`, `OPENAI`), key resolution, optional schema, `extra_body`, resampling, reported cost |
+| `src/openai.rs` | any OpenAI-compatible service: `OPENAI_API_KEY` / `OPENAI_BASE_URL`, Responses API with a strict schema, fallbacks to chat completions / no schema / no temperature, `extra_body`, resampling, reported cost |
 | `src/chatgpt_auth.rs` | subscription credential resolution and explicit Codex device login |
 | `src/cli/{args,render,progress,mod}.rs` | typed flags, writer-based presentation, progress lifecycle, execution/exit codes |
 
@@ -388,20 +398,19 @@ probing, requests up to about 47k still passed and beyond that return HTTP 400
 ## Caveats
 
 - **Your code is sent to the selected backend.** Jev uses TypeSafe's API. ChatGPT uses your
-  ChatGPT subscription over `chatgpt.com`. An OpenAI-compatible backend sends it to the service
-  at its base URL; OpenRouter forwards it to whichever provider serves the model, and providers of
-  free models may log or train on prompts. Do not point `jg` at code
+  ChatGPT subscription over `chatgpt.com`. The `openai` backend sends it to the service at its
+  base URL, with `store: false`; an aggregator such as OpenRouter forwards it to whichever provider
+  serves the model, and providers of free models may log or train on prompts. Do not point `jg` at code
   you may not share.
 - Jev cost scales with lines times queries. A million-line repo is roughly $1 per query, so use
   paths, `-g`, `-l`, or `--triage` to narrow large searches. ChatGPT is billed as a subscription;
   `jg` does not print Jev's per-token dollar price on that path.
-- OpenAI-compatible services differ in what they ration. OpenRouter free models are rate limited
-  (20 requests a minute; 50 a day, or 1000 with credits on the account); `jg` waits out the minute
-  and reports a spent day as an error. A search costs about one request per 150 lines, so narrow
-  large searches, and lower `-j` for a small local server. Result quality is the model's: the
-  OpenRouter default is small, free and not repeatable run to run, and `--model` selects a
-  stronger one. Requests are plain non-streaming chat completions; a service that only streams
-  is not supported.
+- OpenAI-compatible services differ in what they ration. Free models on OpenRouter are rate
+  limited (20 requests a minute; 50 a day, or 1000 with credits on the account); `jg` waits out
+  the minute and reports a spent day as an error. A search costs about one request per 150 lines,
+  so narrow large searches, and lower `-j` for a small local server. Result quality is the
+  model's, and free models are not repeatable run to run. Requests are not streamed; a service
+  that only streams is not supported.
 - ChatGPT requests `service_tier: priority` (the backend rejects `fast`). The served tier may
   still be `default`; the stats line reports what came back.
 - A line probability is "this line answers the query", judged within its chunk. Cross-file
@@ -454,8 +463,9 @@ Additional opt-in commands (live calls send fixture code and incur API usage):
 ```bash
 fnox exec -- cargo +1.98.1 test --test live -- --ignored  # only with explicit live-test authorization
 cargo +1.98.1 test --test chatgpt_cli                 # local HTTP/SSE ChatGPT CLI tests; no live ChatGPT
-cargo +1.98.1 test --test openai_compat_cli           # local OpenAI-compatible CLI tests; no live service
-fnox run -- jg --backend openrouter "<query>" <path>  # live OpenRouter check; send public code only
+cargo +1.98.1 test --test openai_cli                  # local OpenAI-compatible CLI tests; no live service
+# live check through OpenRouter; send public code only
+fnox run -- sh -c 'OPENAI_API_KEY=$OPENROUTER_API_KEY OPENAI_BASE_URL=https://openrouter.ai/api/v1 jg --backend openai --model MODEL "<query>" <path>'
 cargo +1.98.1 build --release && fnox exec -- python3 bench/bench.py  # separate opt-in benchmark
 JG_DEBUG=1 jg ...                                     # log retry reasons
 ```
@@ -464,11 +474,11 @@ The Rust integration tests run the real binary against local HTTP servers. The P
 uses Python's standard library, bounded waits, process reaping and server cleanup; it does
 not snapshot animation timing. `tests/chatgpt_cli.rs` uses a tiny local listener (account
 headers and SSE) with isolated `HOME` / `XDG_*` / `CODEX_HOME` and fake credentials only.
-`tests/openai_compat_cli.rs` does the same for chat completions, as OpenRouter and as an arbitrary
-other service, with fake keys and a fake `fnox` on `PATH` that must never be run. Normal QA and CI
-never send live ChatGPT, OpenRouter or OpenAI requests. Live verification notes are in
+`tests/openai_cli.rs` does the same for the Responses API and chat completions, with fake keys
+and a fake `fnox` on `PATH` that must never be run. Normal QA and CI
+never send live ChatGPT or OpenAI-compatible requests. Live verification notes are in
 [docs/chatgpt-verification.md](docs/chatgpt-verification.md). `JG_BASE_URL` points `jg` at another
-endpoint, `JG_MODEL` at another model, `JG_BACKEND` at `jev`, `chatgpt`, `openrouter` or `openai`, and
+endpoint, `JG_MODEL` at another model, `JG_BACKEND` at `jev`, `chatgpt` or `openai`, and
 `JG_NO_FNOX=1` disables fnox lookup. The [ADRs](docs/adr/README.md)
 record compatibility decisions and the full option/test inventory.
 

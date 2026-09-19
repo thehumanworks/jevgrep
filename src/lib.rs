@@ -8,6 +8,6 @@ pub mod cli;
 pub mod client;
 pub mod files;
 pub mod filters;
-pub mod openai_compat;
+pub mod openai;
 pub mod results;
 pub mod search;

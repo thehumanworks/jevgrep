@@ -38,17 +38,15 @@ Options:
       --no-ignore             Do not honor .gitignore
   -q, --quiet                 No progress or stats on stderr
       --backend <BACKEND>     Decision backend (default: jev, or $JG_BACKEND) [possible values: jev,
-                              chatgpt, openrouter, openai]
+                              chatgpt, openai]
       --chatgpt-login         Run Codex device login for ChatGPT credentials before searching
-      --api-key <KEY>         API key for an OpenAI-compatible backend (default: the preset's
-                              variable)
-      --api-key-env <VAR>     Read that API key from the environment variable VAR instead
-      --json-schema           OpenAI-compatible: send a strict response schema (models with
-                              structured outputs only)
-      --extra-body <JSON>     OpenAI-compatible: JSON object of request fields to add or override;
-                              null removes one
+      --api-key <KEY>         openai: API key (default: $OPENAI_API_KEY)
+      --no-schema             openai: do not ask for structured outputs (for models known not to
+                              support them)
+      --extra-body <JSON>     openai: JSON object of request fields to add or override; null removes
+                              one
       --model <MODEL>         Model, or $JG_MODEL (Jev: jev-latest; ChatGPT: gpt-5.6-luna only;
-                              openrouter, openai: any id)
+                              openai: required, any id)
       --base-url <URL>        Override the selected backend's endpoint (or $JG_BASE_URL)
       --color <WHEN>          Color eligible human output; JSON, flat output, help and usage errors
                               remain plain [default: auto] [possible values: auto, always, never]
@@ -58,17 +56,16 @@ Options:
 environment:
   TYPESAFE_API_KEY        API key. When unset, jg tries `fnox get TYPESAFE_API_KEY`.
   JG_NO_FNOX             When set, disable the fnox key lookup.
-  JG_BACKEND             Backend when --backend is absent: jev (default), chatgpt, openrouter
-                         or openai.
+  JG_BACKEND             Backend when --backend is absent: jev (default), chatgpt or openai.
   CHATGPT_ACCOUNT_ID     ChatGPT account; set together with CHATGPT_ACCESS_TOKEN.
   CHATGPT_ACCESS_TOKEN   ChatGPT subscription access token (not an OpenAI API key).
   CODEX_HOME             Codex cache directory (default: ~/.codex); reads auth.json.
                          ChatGPT also checks $XDG_CONFIG_HOME/auth.toml (~/.config).
-  OPENROUTER_API_KEY     Key for --backend openrouter, unless --api-key or --api-key-env is given.
-  OPENAI_API_KEY         Key for --backend openai, likewise. As with OpenAI's SDKs, it is sent to
-                         whatever base URL is configured. fnox is never consulted for these keys.
-  OPENAI_BASE_URL        API root for --backend openai when --base-url and JG_BASE_URL are absent.
-  JG_EXTRA_BODY          Extra request fields when --extra-body is absent (openrouter, openai).
+  OPENAI_API_KEY         Key for --backend openai when --api-key is absent; sent to whatever base
+                         URL is configured, as OpenAI's SDKs do. fnox is never consulted for it.
+  OPENAI_BASE_URL        API root for --backend openai when --base-url and JG_BASE_URL are absent
+                         (default: https://api.openai.com/v1).
+  JG_EXTRA_BODY          Extra request fields for --backend openai when --extra-body is absent.
   JG_MODEL               Model when --model is absent; empty means the default.
   JG_BASE_URL            Endpoint when --base-url is absent; empty means the default.
   JG_DEBUG               When set, log retry reasons.
@@ -89,12 +86,11 @@ examples:
   jg "where is the timeout set" --not tests --not "command line interface"
   jg --backend chatgpt "where are retries handled" src/
   jg --backend chatgpt --chatgpt-login "where is configuration loaded"
-  jg --backend openrouter "where are retries handled" src/
-  jg --backend openrouter --model vendor/model "where is configuration loaded"
-  jg --backend openai --model MODEL "where is the cache invalidated"   # api.openai.com
+  jg --backend openai --model MODEL "where is the cache invalidated"
+  OPENAI_BASE_URL=https://openrouter.ai/api/v1 jg --backend openai --model VENDOR/MODEL "query"
   jg --backend openai --base-url http://localhost:11434/v1 --model MODEL -j 2 "query"
-  jg --backend openai --base-url https://api.example.com/v1 --api-key-env EXAMPLE_API_KEY \
-     --model MODEL --extra-body '{"reasoning_effort":"low"}' "query"
+  OPENAI_BASE_URL=https://ai-gateway.vercel.sh/v1 jg --backend openai --model typesafe-ai/jev
+  "query"
 
 chatgpt:
   Sends Responses requests directly using your ChatGPT subscription. Uses gpt-5.6-luna,
@@ -103,21 +99,24 @@ chatgpt:
   --chatgpt-login explicitly runs Codex device login; inference never launches Codex.
   Scores are model estimates; Jev's calibration and per-token pricing do not apply.
 
-openai-compatible (--backend openrouter, --backend openai):
-  One chat-completions client for any service or local server that speaks OpenAI's protocol.
-  openrouter is a preset: openrouter.ai, OPENROUTER_API_KEY, default model
-  inclusionai/ling-3.0-flash-fin:free. openai is the general case: api.openai.com unless
-  --base-url names another API root (https://host/v1) or a full /chat/completions URL; it has no
-  default model, so --model is required. Key order: --api-key, the variable named by
-  --api-key-env, then the preset's variable. Prefer a variable: --api-key shows in `ps`. openai
-  with another base URL may go without a key, as local servers do; a key is only ever sent over
-  https, or http on localhost.
-  No response schema is sent by default, since most models cannot enforce one and some reject
-  the attempt: every reply is checked locally and an unusable one is asked for again.
-  --json-schema sends the strict schema, for models with structured outputs. --extra-body
-  passes a service's own request fields through. A model that refuses `temperature` is asked
-  again without it. Rate limits are waited out for up to a minute; lower -j for small servers.
+openai:
+  Any OpenAI-compatible service or local server, configured as OpenAI's SDKs are: OPENAI_API_KEY
+  and OPENAI_BASE_URL (or --api-key and --base-url). OpenRouter, another vendor, a gateway and a
+  local server are each just a base URL, a key or none, and a model; there is no default model,
+  so --model or JG_MODEL is required. The base URL is an API root (https://host/v1), or a full
+  /responses or /chat/completions URL to settle which API is spoken. A key is required for
+  api.openai.com, optional elsewhere, and only ever sent over https, or http on localhost.
+  jg prefers the Responses API with structured outputs (a strict JSON schema), and adapts once
+  per run to what a service refuses: no /responses route, chat completions instead; no
+  structured outputs, no schema; no `temperature`, none sent. --no-schema skips that first
+  refusal for a model known to lack structured outputs. Every reply is checked locally either
+  way, and an unusable one is asked for again. --extra-body passes a service's own request
+  fields through. Rate limits are waited out for up to a minute; lower -j for small servers.
   Scores are model estimates; stats show a cost only where the service reports one.
+  Vercel AI Gateway (https://ai-gateway.vercel.sh/v1) also lists Jev itself, as typesafe-ai/jev,
+  but not behind its OpenAI-compatible routes. With that base URL and model, jg asks Jev on the
+  gateway's TypeSafe-compatible route with the same key: Jev's own answers and calibration, and
+  --no-schema and --extra-body have nothing to apply to.
 
 jev:
   Default endpoint: https://api.typesafe.ai/v1/systemone

@@ -5,3 +5,5 @@ type = "1password"
 
 [secrets]
 TYPESAFE_API_KEY= { provider = "op", value = "op://vault/typesafe/api/key" }
+OPENAI_API_KEY= { provider = "op", value = "op://vault/vercel/ai_gateway/api_key" }
+OPENAI_BASE_URL= { provider = "op", value = "op://vault/vercel/ai_gateway/base_url" }

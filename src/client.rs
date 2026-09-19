@@ -292,8 +292,12 @@ impl Transport for Http {
 pub struct Config {
     pub base_url: String,
     pub model: String,
+    /// Who serves the endpoint, for diagnostics: TypeSafe, or a gateway in front of it.
+    pub provider: String,
     pub timeout: Duration,
     pub max_retries: u32,
+    /// The longest a retry's exponential backoff grows to, in seconds.
+    pub max_backoff: f64,
     pub pool_size: usize,
 }
 
@@ -302,8 +306,10 @@ impl Default for Config {
         Config {
             base_url: DEFAULT_BASE_URL.into(),
             model: DEFAULT_MODEL.into(),
+            provider: "TypeSafe".into(),
             timeout: Duration::from_secs(60),
             max_retries: 8,
+            max_backoff: 30.0,
             pool_size: 64,
         }
     }
@@ -314,7 +320,9 @@ type DebugReporter = dyn Fn(&str) + Send + Sync;
 /// One shared connection pool; safe to call `ask` from many threads.
 pub struct JevClient {
     model: String,
+    provider: String,
     max_retries: u32,
+    max_backoff: f64,
     /// Scales every backoff sleep. Tests set it to zero.
     pub backoff: f64,
     pub usage: Usage,
@@ -343,7 +351,9 @@ impl JevClient {
     pub fn with_transport(transport: Box<dyn Transport>, cfg: Config) -> Self {
         JevClient {
             model: cfg.model,
+            provider: cfg.provider,
             max_retries: cfg.max_retries,
+            max_backoff: cfg.max_backoff,
             backoff: 1.0,
             usage: Usage::default(),
             limiter: AdaptiveLimiter::new(cfg.pool_size, Duration::from_secs(1)),
@@ -381,7 +391,7 @@ impl JevClient {
         for attempt in 0..=self.max_retries {
             if attempt > 0 {
                 self.usage.add_retry();
-                self.sleep((0.5 * 2f64.powi(attempt as i32 - 1)).min(30.0) * (0.5 + jitter()));
+                self.sleep((0.5 * 2f64.powi(attempt as i32 - 1)).min(self.max_backoff) * (0.5 + jitter()));
             }
             self.limiter.acquire();
             let sent = self.transport.post(&body);
@@ -404,7 +414,7 @@ impl JevClient {
             }
             let text: String = reply.body.chars().take(400).collect();
             if reply.status == 401 || reply.status == 403 {
-                return Err(JevError::Auth(format!("TypeSafe rejected the API key (HTTP {}): {text}", reply.status)));
+                return Err(JevError::Auth(format!("{} rejected the API key (HTTP {}): {text}", self.provider, reply.status)));
             }
             if text.contains("max_tokens_exceeded") || reply.status == 413 {
                 return Err(JevError::TokenLimit(text));
