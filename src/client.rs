@@ -20,7 +20,7 @@ const RETRYABLE: &[u16] = &[408, 409, 425, 429, 500, 502, 503, 504, 529];
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum JevError {
-    /// Missing or rejected API key.
+    /// Missing or rejected credentials.
     Auth(String),
     /// The request exceeded the model's context. Callers should split and retry.
     TokenLimit(String),
@@ -46,11 +46,15 @@ pub struct Usage {
 }
 
 impl Usage {
-    fn add(&self, usage: Option<&Value>) {
+    pub(crate) fn add(&self, usage: Option<&Value>) {
         let field = |k: &str| usage.and_then(|u| u.get(k)).and_then(Value::as_u64).unwrap_or(0);
         self.requests.fetch_add(1, Ordering::Relaxed);
         self.input_tokens.fetch_add(field("input_tokens"), Ordering::Relaxed);
         self.output_tokens.fetch_add(field("output_tokens"), Ordering::Relaxed);
+    }
+
+    pub(crate) fn add_retry(&self) {
+        self.retries.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn requests(&self) -> u64 {
@@ -329,7 +333,7 @@ impl JevClient {
         let mut last = String::from("unknown error");
         for attempt in 0..=self.max_retries {
             if attempt > 0 {
-                self.usage.retries.fetch_add(1, Ordering::Relaxed);
+                self.usage.add_retry();
                 self.sleep((0.5 * 2f64.powi(attempt as i32 - 1)).min(30.0) * (0.5 + jitter()));
             }
             self.limiter.acquire();

@@ -273,13 +273,20 @@ class PackageTests(unittest.TestCase):
             os.environ,
             {
                 "TYPESAFE_API_KEY": "secret",
+                "CHATGPT_ACCOUNT_ID": "account-secret",
+                "CHATGPT_ACCESS_TOKEN": "token-secret",
+                "CODEX_HOME": "/private/codex-cache",
+                "JG_BACKEND": "chatgpt",
                 "GH_TOKEN": "secret",
                 "JG_MODEL": "user-model",
                 "GIT_CONFIG_COUNT": "5",
             },
         ):
             env = package.smoke_environment(self.root / "home")
-        for name in ("TYPESAFE_API_KEY", "GH_TOKEN", "JG_MODEL", "GIT_CONFIG_COUNT"):
+        for name in (
+            "TYPESAFE_API_KEY", "CHATGPT_ACCOUNT_ID", "CHATGPT_ACCESS_TOKEN",
+            "CODEX_HOME", "JG_BACKEND", "GH_TOKEN", "JG_MODEL", "GIT_CONFIG_COUNT",
+        ):
             self.assertNotIn(name, env)
         self.assertEqual(env["JG_NO_FNOX"], "1")
         self.assertEqual(env["GIT_CONFIG_GLOBAL"], os.devnull)
@@ -331,6 +338,10 @@ elif name == "cargo" and "build" in args:
             PATH=f"{binary}:{os.defpath}",
             HOME=str(user_home),
             TYPESAFE_API_KEY="real-secret",
+            CHATGPT_ACCOUNT_ID="account-secret",
+            CHATGPT_ACCESS_TOKEN="token-secret",
+            CODEX_HOME=str(user_home / ".codex"),
+            JG_BACKEND="chatgpt",
             GH_TOKEN="real-secret",
             JG_MODEL="private",
             RUSTUP_TOOLCHAIN="nightly",
@@ -362,6 +373,10 @@ elif name == "cargo" and "build" in args:
             self.assertNotEqual(env["HOME"], original["HOME"])
             for secret in (
                 "TYPESAFE_API_KEY",
+                "CHATGPT_ACCOUNT_ID",
+                "CHATGPT_ACCESS_TOKEN",
+                "CODEX_HOME",
+                "JG_BACKEND",
                 "GH_TOKEN",
                 "JG_MODEL",
                 "RUSTUP_TOOLCHAIN",

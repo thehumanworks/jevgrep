@@ -1,5 +1,8 @@
-//! jevgrep: natural-language code search powered by TypeSafe's Jev decision model.
+//! jevgrep: natural-language code search using pluggable typed decision backends.
 
+pub mod backend;
+pub mod chatgpt;
+pub mod chatgpt_auth;
 pub mod cli;
 pub mod client;
 pub mod files;

@@ -4,7 +4,7 @@ mod args;
 mod progress;
 mod render;
 
-pub use args::{parse_args, Args, ColorMode, Parsed};
+pub use args::{parse_args, Args, BackendKind, ColorMode, Parsed};
 pub use render::{render_files, render_json, render_text};
 
 use std::ffi::OsString;
@@ -12,6 +12,9 @@ use std::io::{self, IsTerminal, Write};
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::backend::DecisionBackend;
+use crate::chatgpt::{ChatGptClient, ChatGptConfig};
+use crate::chatgpt_auth::{device_login, resolve_credentials};
 use crate::client::{resolve_api_key, Config, JevClient, JevError};
 use crate::files::{discover, Discover};
 use crate::filters::{parse_filter, Rules};
@@ -134,14 +137,9 @@ fn execute(args: &Args, out: &mut dyn Write) -> io::Result<i32> {
         rules: (!rules.is_empty()).then(|| rules.clone()),
         ..Options::default()
     };
-    let searched = resolve_api_key().and_then(|key| {
-        let cfg = Config { base_url: args.base_url.clone(), model: args.model.clone(), pool_size: args.jobs.max(8), ..Config::default() };
-        let mut client = JevClient::new(&key, cfg);
-        if std::env::var_os("JG_DEBUG").is_some() {
-            let debug_progress = Arc::clone(&progress);
-            client.set_debug_reporter(move |msg| debug_progress.suspend(|| eprintln!("jg[debug]: {msg}")));
-        }
-        search(&client, &args.queries, &files, &opts, |done, total| progress.update(done, total), note).map(|ranked| (ranked, client))
+    let searched = build_backend(args, &progress).and_then(|client| {
+        search(client.as_ref(), &args.queries, &files, &opts, |done, total| progress.update(done, total), note)
+            .map(|ranked| (ranked, client))
     });
     // Finish before *all* final diagnostics and before any fallible result write.
     progress.finish_and_clear();
@@ -152,7 +150,11 @@ fn execute(args: &Args, out: &mut dyn Write) -> io::Result<i32> {
             return Ok(2);
         }
         Err(e) => {
-            eprintln!("jg: {}", diagnostics.notice(format!("TypeSafe API error: {e}")));
+            let provider = match args.backend {
+                BackendKind::Jev => "TypeSafe",
+                BackendKind::Chatgpt => "ChatGPT",
+            };
+            eprintln!("jg: {}", diagnostics.notice(format!("{provider} API error: {e}")));
             return Ok(2);
         }
     };
@@ -199,18 +201,56 @@ fn execute(args: &Args, out: &mut dyn Write) -> io::Result<i32> {
         eprintln!("jg: filter removed {regions} matching region{} and {lines} line{}", plural(regions), plural(lines));
     }
     if !args.quiet {
-        let usage = &client.usage;
+        let usage = client.usage();
         let retries = if usage.retries() > 0 { format!(", {} retries", usage.retries()) } else { String::new() };
-        eprintln!(
-            "jg: {} files, {} requests{retries}, {} tokens (~${:.4}), {:.1}s",
-            files.len(),
-            usage.requests(),
-            thousands(usage.input_tokens()),
-            usage.cost_usd(),
-            started.elapsed().as_secs_f64()
-        );
+        match args.backend {
+            BackendKind::Jev => eprintln!(
+                "jg: {} files, {} requests{retries}, {} tokens (~${:.4}), {:.1}s",
+                files.len(),
+                usage.requests(),
+                thousands(usage.input_tokens()),
+                usage.cost_usd(),
+                started.elapsed().as_secs_f64()
+            ),
+            BackendKind::Chatgpt => eprintln!(
+                "jg: {} files, {} requests{retries}, {} input / {} output tokens (ChatGPT subscription; requested priority, served {}), {:.1}s",
+                files.len(),
+                usage.requests(),
+                thousands(usage.input_tokens()),
+                thousands(usage.output_tokens()),
+                client.service_tier().as_deref().unwrap_or("unreported"),
+                started.elapsed().as_secs_f64()
+            ),
+        }
     }
     Ok(if any { 0 } else { 1 })
+}
+
+fn build_backend(args: &Args, progress: &Arc<Progress>) -> Result<Box<dyn DecisionBackend>, JevError> {
+    let debug_progress = Arc::clone(progress);
+    let reporter = move |msg: &str| debug_progress.suspend(|| eprintln!("jg[debug]: {msg}"));
+    let debug = std::env::var_os("JG_DEBUG").is_some();
+    match args.backend {
+        BackendKind::Jev => {
+            let key = resolve_api_key()?;
+            let cfg =
+                Config { base_url: args.base_url.clone(), model: args.model.clone(), pool_size: args.jobs.max(8), ..Config::default() };
+            let mut client = JevClient::new(&key, cfg);
+            if debug {
+                client.set_debug_reporter(reporter);
+            }
+            Ok(Box::new(client))
+        }
+        BackendKind::Chatgpt => {
+            let credentials = if args.chatgpt_login { device_login()? } else { resolve_credentials()? };
+            let cfg = ChatGptConfig { base_url: args.base_url.clone(), pool_size: args.jobs, ..ChatGptConfig::default() };
+            let mut client = ChatGptClient::new(&credentials, cfg);
+            if debug {
+                client.set_debug_reporter(reporter);
+            }
+            Ok(Box::new(client))
+        }
+    }
 }
 
 #[cfg(test)]

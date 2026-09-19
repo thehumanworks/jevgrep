@@ -1,4 +1,4 @@
-//! Turns (queries, files) into Jev requests, fans them out over threads, aggregates answers.
+//! Turns (queries, files) into typed decisions, fans them out over threads, aggregates answers.
 //!
 //! One request per file chunk. Each request carries, per query:
 //!   - one Score question: how relevant is this file section to the query (ranks files)
@@ -9,6 +9,8 @@
 //! but its block does, which is why regions and not lines are the primary unit of output.
 //! Jev evaluates every question in a request in parallel, so extra queries and extra
 //! lines add tokens but almost no latency. Extra queries reuse the same state.
+//! A backend that answers sequentially is the opposite: there a small search is cut into more,
+//! smaller requests until they fill the idle lanes (see `spread`).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -17,7 +19,7 @@ use std::sync::mpsc;
 
 use serde_json::{json, Map, Value};
 
-use crate::client::{JevClient, JevError};
+use crate::backend::{DecisionBackend, DecisionError};
 use crate::files::{chunk_lines, display_path, indent, is_definition, read_lines, split_chunk, Chunk, Chunking};
 use crate::filters::{Rules, FILTER_GATE};
 
@@ -239,13 +241,22 @@ pub fn build_request(
 
 type Answers = Map<String, Value>;
 
-fn ask_chunk(client: &JevClient, queries: &[String], chunk: Chunk, opts: &Options) -> Result<Vec<(Chunk, Answers)>, JevError> {
+fn ask_chunk(
+    client: &dyn DecisionBackend,
+    queries: &[String],
+    chunk: Chunk,
+    opts: &Options,
+) -> Result<Vec<(Chunk, Answers)>, DecisionError> {
     let (state, questions) = build_request(queries, &chunk, opts.files_only, opts.broad, opts.rules.as_ref());
     match client.ask(&state, &questions) {
         Ok(answers) => Ok(vec![(chunk, answers)]),
-        Err(JevError::TokenLimit(_)) => {
+        Err(error @ DecisionError::TokenLimit(_)) => {
+            let parts = split_chunk(&chunk);
+            if parts.is_empty() {
+                return Err(error);
+            }
             let mut out = Vec::new();
-            for part in split_chunk(&chunk) {
+            for part in parts {
                 out.extend(ask_chunk(client, queries, part, opts)?);
             }
             Ok(out)
@@ -283,15 +294,65 @@ fn fan_out<T: Send, R: Send>(items: Vec<T>, jobs: usize, job: impl Fn(T) -> R + 
     });
 }
 
+/// Files a reader thread takes at a time: enough that hand-offs stay rare, few enough that one
+/// slow batch does not hold the rest up. Measured on 579 files, batches of 6 on 8 threads cut
+/// read-and-chunk from 230 ms to 77 ms; batches of 32 were no faster.
+const READ_BATCH: usize = 6;
+const READ_THREADS: usize = 8;
+
+/// Reads and chunks `named` in parallel batches. Chunks come back in file order.
+fn read_chunks(named: &[(String, &PathBuf)], cfg: Chunking) -> Vec<Chunk> {
+    let batches: Vec<(usize, &[(String, &PathBuf)])> = named.chunks(READ_BATCH).enumerate().collect();
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(READ_THREADS);
+    let read = |(at, batch): (usize, &[(String, &PathBuf)])| {
+        let chunks: Vec<Chunk> =
+            batch.iter().filter_map(|(shown, path)| Some(chunk_lines(shown, &read_lines(path)?, cfg))).flatten().collect();
+        (at, chunks)
+    };
+    let mut parts = Vec::with_capacity(batches.len());
+    fan_out(batches, threads, read, |part| {
+        parts.push(part);
+        true
+    });
+    parts.sort_by_key(|&(at, _)| at);
+    parts.into_iter().flat_map(|(_, chunks)| chunks).collect()
+}
+
+/// The share of `jobs` a spread search aims to fill. Blocks pack unevenly, so aiming at every lane
+/// overshoots, and one request too many waits a whole round for a free lane.
+const SPREAD_LANES: f64 = 0.75;
+/// Spreading stops at a quarter of the usual chunk. Measured live on a 390-line file: 150-line
+/// chunks took 7.3 s, 40-line chunks 3.5 s, 12-line chunks 4.0 s and 2.5x the input tokens.
+const SPREAD_FLOOR: f64 = 0.25;
+
+/// Divide and conquer for a backend that answers sequentially. A request takes as long as its
+/// answers take to write, so `chunks` requests on `jobs` lanes leave lanes idle while each request
+/// is as slow as it can be. Returns the finer chunking that fills the lanes, or None when the
+/// search already does: then large chunks are cheaper, and no slower.
+fn spread(cfg: Chunking, chunks: usize, jobs: usize) -> Option<Chunking> {
+    let lanes = jobs as f64 * SPREAD_LANES;
+    if chunks == 0 || chunks as f64 >= lanes {
+        return None;
+    }
+    let scale = (chunks as f64 / lanes).max(SPREAD_FLOOR);
+    let scaled = |n: usize| ((n as f64 * scale).ceil() as usize).max(1);
+    Some(Chunking { max_lines: scaled(cfg.max_lines), max_tokens: scaled(cfg.max_tokens), ..cfg })
+}
+
 fn noul(answers: &Answers, key: &str) -> Option<f64> {
     Some(answers.get(key)?.get("noul").and_then(Value::as_f64).unwrap_or(0.0))
 }
 
 /// Cheap pre-filter on file paths alone. Returns path -> P(worth opening).
-pub fn triage_paths(client: &JevClient, queries: &[String], paths: &[String], jobs: usize) -> Result<HashMap<String, f64>, JevError> {
+pub fn triage_paths(
+    client: &dyn DecisionBackend,
+    queries: &[String],
+    paths: &[String],
+    jobs: usize,
+) -> Result<HashMap<String, f64>, DecisionError> {
     let wanted = queries.join(" | ");
     let batches: Vec<&[String]> = paths.chunks(250).collect();
-    let run = |batch: &[String]| -> Result<Vec<(String, f64)>, JevError> {
+    let run = |batch: &[String]| -> Result<Vec<(String, f64)>, DecisionError> {
         let named: Map<String, Value> = batch.iter().enumerate().map(|(i, p)| (format!("p{i}"), json!(p))).collect();
         let state = json!({
             "task": "decide which files are worth opening for a code search",
@@ -330,13 +391,13 @@ pub fn triage_paths(client: &JevClient, queries: &[String], paths: &[String], jo
 
 /// Returns one ranked FileResult list per query (unfiltered; callers apply thresholds).
 pub fn search(
-    client: &JevClient,
+    client: &dyn DecisionBackend,
     queries: &[String],
     files: &[PathBuf],
     opts: &Options,
     mut progress: impl FnMut(usize, usize),
     mut note: impl FnMut(&str),
-) -> Result<Vec<Vec<FileResult>>, JevError> {
+) -> Result<Vec<Vec<FileResult>>, DecisionError> {
     let mut named: Vec<(String, &PathBuf)> = files.iter().map(|p| (display_path(p), p)).collect();
     if opts.triage || named.len() > opts.max_files {
         let shown: Vec<String> = named.iter().map(|(d, _)| d.clone()).collect();
@@ -354,7 +415,11 @@ pub fn search(
     // Roughly one block question per 8 lines.
     let per_line = if opts.files_only { 0.0 } else { queries.len() as f64 + 0.12 * terms.len() as f64 };
     let cfg = Chunking { max_lines: opts.chunk_lines, max_tokens: opts.chunk_tokens, questions_per_line: per_line, ..Chunking::default() };
-    let chunks: Vec<Chunk> = named.iter().filter_map(|(shown, path)| Some(chunk_lines(shown, &read_lines(path)?, cfg))).flatten().collect();
+    let mut chunks = read_chunks(&named, cfg);
+    if let Some(finer) = spread(cfg, chunks.len(), opts.jobs).filter(|_| client.answers_sequentially()) {
+        // Few enough files that reading them again costs nothing next to one request.
+        chunks = read_chunks(&named, finer);
+    }
 
     let mut per_query: Vec<HashMap<String, FileResult>> = vec![HashMap::new(); queries.len()];
     let mut section_keeps: HashMap<String, Vec<f64>> = HashMap::new();
@@ -413,7 +478,7 @@ pub fn search(
         |outcome| {
             match outcome {
                 Ok(parts) => parts.iter().for_each(|(chunk, answers)| absorb(chunk, answers)),
-                Err(e @ JevError::Auth(_)) => {
+                Err(e @ DecisionError::Auth(_)) => {
                     fatal = Some(e);
                     return false;
                 }

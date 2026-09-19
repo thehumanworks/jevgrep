@@ -1,16 +1,24 @@
 # jevgrep (`jg`)
 
 Natural-language grep. Ask a question about a codebase in plain language and get back the files
-and line numbers that answer it, each with a calibrated probability.
+and line numbers that answer it.
 
-`jg` is built on [Jev](https://typesafe.ai/blog/introducing-system-one-models-and-jev), TypeSafe's
-decision model. Jev does not generate text. It takes a state plus typed questions and returns
-calibrated probabilities, evaluating every question in a request in parallel. `jg` exploits that:
-each file chunk becomes one request carrying one question per line, and all requests fan out over
-a thread pool. A 9,000-line codebase is scored line by line in about 2 seconds for about 1 cent.
+`jg` is built on a reusable decision backend: it sends a JSON `state` plus named typed questions
+and receives a Jev-compatible `answers` map (`noul` / `score`). Search, filters and rendering
+are independent of the provider. The default backend is [Jev](https://typesafe.ai/blog/introducing-system-one-models-and-jev),
+TypeSafe's decision model. Jev does not generate text. It returns calibrated probabilities and
+evaluates every question in a request in parallel. `jg` exploits that: each file chunk becomes
+one request carrying one question per line, and all requests fan out over a thread pool.
+A 9,000-line codebase is scored line by line in about 2 seconds for about 1 cent.
 
-`jg` is a single native binary written in Rust, about 3.1 MB on the Linux GNU host build,
-with no runtime to install. Its only dynamic dependencies are libc and libgcc, and TLS roots are compiled in.
+`--backend chatgpt` (or `JG_BACKEND=chatgpt`) uses your ChatGPT subscription instead, posting
+directly to `https://chatgpt.com/backend-api/codex/responses` with fixed model `gpt-5.6-luna`.
+That path is not Codex inference. ChatGPT scores use the same grep JSON/text schema as Jev, but
+they are generative relevance estimates, not empirically calibrated probabilities.
+
+`jg` is a single native binary written in Rust, with no runtime to install. The Linux GNU
+host release build with both backends is about 3.3 MB (3,276,688 bytes).
+Its only dynamic dependencies are libc and libgcc, and TLS roots are compiled in.
 
 ```console
 $ jg "which HTTP method is used after a 303 redirect"
@@ -22,6 +30,9 @@ httpx/_client.py  relevance=1.00
 jg: 23 files, 72 requests, 301,208 tokens (~$0.0127), 2.2s
 ```
 
+Jev stats include a token dollar estimate. ChatGPT subscription stats do not: they report
+input and output tokens, that priority was requested, and the tier the server actually served.
+
 ## Reading the output
 
 Every row has the same shape: location, probability, text.
@@ -31,6 +42,9 @@ Every row has the same shape: location, probability, text.
 | file header | path | `relevance`: the best evidence in the file; files are sorted by it |
 | region | `494-508` | these lines contain the code you are looking for |
 | line | `502` | this line directly answers the query |
+
+Jev probabilities are calibrated: 0.9 means right about 9 times in 10. ChatGPT values in the
+same columns are model estimates and are not calibrated that way.
 
 Regions are logical blocks (a function, a method, a paragraph), and adjacent matching blocks are
 merged. Lines are nested under the region they belong to. Two rules keep the output honest:
@@ -148,10 +162,26 @@ target (`rustup target add x86_64-unknown-linux-musl`, plus a musl C compiler fo
 and building with `--target x86_64-unknown-linux-musl`; `.github/workflows/release.yml` does
 exactly that on every `v*` tag. Windows is not built or tested.
 
-`jg` needs `TYPESAFE_API_KEY`. It reads the environment variable first, then falls back to
+`jg` needs `TYPESAFE_API_KEY` for the default Jev backend. It reads the environment variable first, then falls back to
 `fnox get TYPESAFE_API_KEY`. This repo's `fnox.toml` already provides it, so inside this repo
 `jg` just works. To use `jg` in other repos, export the variable or add the secret to your global
 fnox config.
+
+The ChatGPT backend does not use that key. It needs a ChatGPT subscription pair, resolved in this
+order and never mixed across sources:
+
+1. Complete `CHATGPT_ACCOUNT_ID` and `CHATGPT_ACCESS_TOKEN` together.
+2. Optional `$XDG_CONFIG_HOME/auth.toml` (must be an absolute XDG path) or `~/.config/auth.toml`.
+   TOML may use those uppercase keys, lowercase `account_id` / `access_token`, or the same
+   lowercase pair under `[chatgpt]` or `[tokens]`.
+3. `$CODEX_HOME/auth.json` or `~/.codex/auth.json` (`tokens.account_id` / `tokens.access_token`).
+
+A partial or invalid selected pair is an error. Normal searches never start an interactive login.
+`--chatgpt-login` is explicit: it runs `codex login --device-auth` with file-backed storage,
+sends Codex's stdout to stderr, then reads the new cache (stale env/TOML cannot hide a fresh
+login) and continues the search. A stale Codex cache fails at the server with an actionable
+`--chatgpt-login` hint. Live protocol notes and QA evidence live in
+[docs/chatgpt-verification.md](docs/chatgpt-verification.md).
 
 ## Usage
 
@@ -174,7 +204,11 @@ jg QUERY [PATH ...]
 | `--json` | one object per file: `relevance`, `match` (`strong` or `weak`), `regions[]` each with `start`, `end`, `p`, `label`, `label_line`, `lines[]`, plus top-level `lines[]` for lines outside any shown region |
 | `--no-heading` | flat rows: `path:START-END:prob:label` for regions, `path:LINE:prob:text` for lines; matches only |
 | `--triage` | pre-filter files by path first; automatic above `--max-files` (1500) |
-| `-j 32` | concurrent requests (must be positive) |
+| `-j N` | concurrent requests (must be positive; default 32). On ChatGPT a search with fewer chunks than lanes is cut into smaller requests to fill them |
+| `--backend jev\|chatgpt` | decision backend; default `jev`, or `$JG_BACKEND` |
+| `--chatgpt-login` | ChatGPT only: run Codex device login, then search; requires a query |
+| `--model MODEL` | Jev model (`jev-latest` or `$JG_MODEL`). ChatGPT is `gpt-5.6-luna` only; any other `--model` or `$JG_MODEL` is an error unless `--model gpt-5.6-luna` overrides |
+| `--base-url URL` | override the selected backend endpoint, or `$JG_BASE_URL`. ChatGPT accepts HTTPS, or HTTP on `localhost` / `127.0.0.1` / `::1`, and does not follow redirects |
 | `--color auto\|always\|never` | styling for human output; default `auto` |
 
 Exit status follows grep: `0` matches, `1` none, `2` error. Results go to stdout; progress and the
@@ -209,8 +243,10 @@ stderr progress. Progress is cleared before final results, stats, or errors; not
 it without losing redirected diagnostics. Quiet suppresses notes/progress/stats, not errors. Explicit `JG_DEBUG` retry logs
 also suspend progress safely and retain their existing quiet-mode behavior.
 
+Explicit `--backend` overrides `JG_BACKEND`; unset or empty environment values use `jev`.
 Explicit `--model`/`--base-url` overrides `JG_MODEL`/`JG_BASE_URL`; unset or empty environment
-values use the documented defaults. API-key/fnox resolution remains outside parsing.
+values use the selected backend's default. API-key/fnox and ChatGPT credential resolution
+remain outside parsing. `--chatgpt-login` without a ChatGPT backend is a usage error.
 
 ## For coding agents
 
@@ -220,7 +256,8 @@ Paste this into `CLAUDE.md` or `AGENTS.md`:
 ## Code search with jg
 Use `jg "<question>" [path]` when you know what you are looking for but not what it is called.
 Rows are `location  probability  text`. A range like `494-508` is a region to Read; a single
-number is a line that directly answers the query. Probabilities are calibrated.
+number is a line that directly answers the query. Jev probabilities are calibrated; ChatGPT
+(`--backend chatgpt`) scores are uncalibrated estimates with the same output schema.
 - Every row above the `-- weaker` separator cleared the threshold on its own. Rows below it are near misses; ignore them unless the matches above are not enough.
 - Ask several things at once: `jg "q1" -e "q2" -e "q3"`. One pass, shared cost.
 - Orient first with `jg -l "<topic>"` to rank files, then Read the top hits.
@@ -240,11 +277,18 @@ every thread pauses briefly and concurrency halves, then grows back on success.
 2. **Split** each file into logical blocks using blank lines, indentation and definition
    keywords, then pack blocks into chunks of up to 150 lines within a token budget that shrinks
    as queries are added. Chunks break between blocks and carry 12 lines of leading context.
-3. **Ask Jev**, one request per chunk. State is the query plus a line-numbered listing. Questions
+3. **Ask the selected backend**, one request per chunk. State is the query plus a line-numbered listing. Questions
    per query: one `score` for the section (ranks files), one `noul` per block ("do lines A-B
    contain the code the query is looking for"), and one `noul` per non-blank line ("does line N
    directly answer the query"). With a filter, add one `noul` per category per section and per
-   block, asked once regardless of the number of queries.
+   block, asked once regardless of the number of queries. Jev evaluates those questions in one
+   System One request. ChatGPT sends the same state and questions to the subscription Responses
+   endpoint as a strict `{answers:{...}}` schema and assembles the map from SSE
+   `response.output_text` deltas/done events (`response.completed` may have empty `output`).
+   ChatGPT writes its answers token by token, so a request is as slow as its reply is long. The
+   reply is therefore terse (a bare integer percentage per question under a positional id; the
+   Jev-shaped answer is rebuilt locally), reasoning effort is `low`, and a search too small to
+   fill `-j` lanes is split into finer chunks, down to a quarter of `--chunk-lines`.
 4. **Select** what to show with the rules in `src/results.rs`: a row is printed only if
    its own probability clears `-t`; no source line appears twice; every shown file carries a
    location; matches come before near misses.
@@ -254,11 +298,14 @@ exponential backoff and jitter.
 
 | Module | Role |
 |---|---|
+| `src/backend.rs` | `DecisionBackend`: `ask(state, questions) -> answers`, plus usage and optional served tier |
 | `src/files.rs` | discovery, block splitting, chunking |
 | `src/filters.rs` | plain-language filter parsing, polar rules |
-| `src/search.rs` | request building, thread fan-out, answer aggregation |
+| `src/search.rs` | request building, thread fan-out, answer aggregation over any backend |
 | `src/results.rs` | display rules: what is shown, in which tier |
-| `src/client.rs` | HTTP client, retries, adaptive rate limiting |
+| `src/client.rs` | Jev HTTP client, retries, adaptive rate limiting |
+| `src/chatgpt.rs` | ChatGPT Responses client: `gpt-5.6-luna`, requested `priority`, SSE assembly |
+| `src/chatgpt_auth.rs` | subscription credential resolution and explicit Codex device login |
 | `src/cli/{args,render,progress,mod}.rs` | typed flags, writer-based presentation, progress lifecycle, execution/exit codes |
 
 `jg` began as a Python prototype (commit `31b4c25`). The Rust port sends byte-identical requests
@@ -294,9 +341,13 @@ probing, requests up to about 47k still passed and beyond that return HTTP 400
 
 ## Caveats
 
-- **Your code is sent to TypeSafe's API.** Do not point `jg` at code you may not share.
-- Cost scales with lines times queries. A million-line repo is roughly $1 per query, so use
-  paths, `-g`, `-l`, or `--triage` to narrow large searches.
+- **Your code is sent to the selected backend.** Jev uses TypeSafe's API. ChatGPT uses your
+  ChatGPT subscription over `chatgpt.com`. Do not point `jg` at code you may not share.
+- Jev cost scales with lines times queries. A million-line repo is roughly $1 per query, so use
+  paths, `-g`, `-l`, or `--triage` to narrow large searches. ChatGPT is billed as a subscription;
+  `jg` does not print Jev's per-token dollar price on that path.
+- ChatGPT requests `service_tier: priority` (the backend rejects `fast`). The served tier may
+  still be `default`; the stats line reports what came back.
 - A line probability is "this line answers the query", judged within its chunk. Cross-file
   reasoning is left to the caller.
 
@@ -346,14 +397,19 @@ Additional opt-in commands (live calls send fixture code and incur API usage):
 
 ```bash
 fnox exec -- cargo +1.98.1 test --test live -- --ignored  # only with explicit live-test authorization
+cargo +1.98.1 test --test chatgpt_cli                 # local HTTP/SSE ChatGPT CLI tests; no live ChatGPT
 cargo +1.98.1 build --release && fnox exec -- python3 bench/bench.py  # separate opt-in benchmark
 JG_DEBUG=1 jg ...                                     # log retry reasons
 ```
 
 The Rust integration tests run the real binary against local HTTP servers. The PTY harness
 uses Python's standard library, bounded waits, process reaping and server cleanup; it does
-not snapshot animation timing. `JG_BASE_URL` points `jg` at another endpoint, `JG_MODEL`
-at another model, and `JG_NO_FNOX=1` disables fnox lookup. The [ADRs](docs/adr/README.md)
+not snapshot animation timing. `tests/chatgpt_cli.rs` uses a tiny local listener (account
+headers and SSE) with isolated `HOME` / `XDG_*` / `CODEX_HOME` and fake credentials only.
+Normal QA and CI never send live ChatGPT requests. Live verification notes are in
+[docs/chatgpt-verification.md](docs/chatgpt-verification.md). `JG_BASE_URL` points `jg` at another
+endpoint, `JG_MODEL` at another Jev model, `JG_BACKEND` at `jev` or `chatgpt`, and
+`JG_NO_FNOX=1` disables fnox lookup. The [ADRs](docs/adr/README.md)
 record compatibility decisions and the full option/test inventory.
 
 ### Releasing

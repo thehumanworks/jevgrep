@@ -1,5 +1,5 @@
-jevgrep: search code with a natural-language query. Every file chunk is scored line by line by
-TypeSafe's Jev model, in parallel.
+jevgrep: search code with a natural-language query. Score files, regions and lines with Jev or
+ChatGPT, in parallel.
 
 Usage: jg [OPTIONS] <QUERY> [PATH]...
 
@@ -26,20 +26,22 @@ Options:
   -C, --context <N>           Lines of context around each pinpointed line [default: 0]
   -g, --glob <GLOB>           Only search files matching GLOB (repeatable)
   -x, --exclude <GLOB>        Skip files matching GLOB (repeatable)
-  -j, --jobs <N>              Concurrent Jev requests [default: 32]
+  -j, --jobs <N>              Concurrent requests [default: 32]
       --json                  JSON lines, one object per matching file
       --no-heading            Flat output: path:START-END:prob:label or path:LINE:prob:text; no
                               weaker tier
-      --triage                Pre-filter files by path with Jev first (automatic above --max-files)
+      --triage                Pre-filter files by path first (automatic above --max-files)
       --max-files <N>         File cap before path triage kicks in [default: 1500]
       --max-filesize <BYTES>  Skip files larger than BYTES [default: 512000]
-      --chunk-lines <N>       Lines per Jev request [default: 150]
+      --chunk-lines <N>       Most lines per request (ChatGPT may use fewer) [default: 150]
       --hidden                Include dotfiles
       --no-ignore             Do not honor .gitignore
   -q, --quiet                 No progress or stats on stderr
-      --model <MODEL>         Jev model (default: jev-latest, or $JG_MODEL)
-      --base-url <URL>        API endpoint (default: https://api.typesafe.ai/v1/systemone, or
-                              $JG_BASE_URL)
+      --backend <BACKEND>     Decision backend (default: jev, or $JG_BACKEND) [possible values: jev,
+                              chatgpt]
+      --chatgpt-login         Run Codex device login for ChatGPT credentials before searching
+      --model <MODEL>         Model (Jev: jev-latest or $JG_MODEL; ChatGPT: gpt-5.6-luna only)
+      --base-url <URL>        Override the selected backend's endpoint (or $JG_BASE_URL)
       --color <WHEN>          Color eligible human output; JSON, flat output, help and usage errors
                               remain plain [default: auto] [possible values: auto, always, never]
   -h, --help                  Print help
@@ -48,6 +50,11 @@ Options:
 environment:
   TYPESAFE_API_KEY        API key. When unset, jg tries `fnox get TYPESAFE_API_KEY`.
   JG_NO_FNOX             When set, disable the fnox key lookup.
+  JG_BACKEND             Backend when --backend is absent: jev (default) or chatgpt.
+  CHATGPT_ACCOUNT_ID     ChatGPT account; set together with CHATGPT_ACCESS_TOKEN.
+  CHATGPT_ACCESS_TOKEN   ChatGPT subscription access token (not an OpenAI API key).
+  CODEX_HOME             Codex cache directory (default: ~/.codex); reads auth.json.
+                         ChatGPT also checks $XDG_CONFIG_HOME/auth.toml (~/.config).
   JG_MODEL               Model when --model is absent; empty means the default.
   JG_BASE_URL            Endpoint when --base-url is absent; empty means the default.
   JG_DEBUG               When set, log retry reasons.
@@ -66,6 +73,18 @@ examples:
   jg --json "where is the retry budget set" | jq .
   jg "where are requests retried" --filter "Source code only. No tests or documentation"
   jg "where is the timeout set" --not tests --not "command line interface"
+  jg --backend chatgpt "where are retries handled" src/
+  jg --backend chatgpt --chatgpt-login "where is configuration loaded"
+
+chatgpt:
+  Sends Responses requests directly using your ChatGPT subscription. Uses gpt-5.6-luna,
+  requests priority (fast) service, and returns the same output format as Jev.
+  Credential order: environment pair, auth.toml, then ~/.codex/auth.json (or CODEX_HOME).
+  --chatgpt-login explicitly runs Codex device login; inference never launches Codex.
+  Scores are model estimates; Jev's calibration and per-token pricing do not apply.
+
+jev:
+  Default endpoint: https://api.typesafe.ai/v1/systemone
 
 filters:
   --filter takes plain language. jg splits it into categories and asks Jev one positive question
@@ -85,6 +104,6 @@ Only rows that clear -t are printed, and no source line is printed twice. A line
 when its surrounding block does not; it is then listed on its own, without a region row. A broad
 query ("how does auth work") has no single answering line, so it returns regions only. Files that
 look related overall but hold nothing above -t are listed last, under a "weaker" separator, and
-only with near misses (at least 0.7 x -t). Probabilities are calibrated: 0.9 means right about 9
-times in 10. Raise -t for precision, lower it for recall. Exit status: 0 matches found, 1 none, 2
+only with near misses (at least 0.7 x -t). Jev probabilities are calibrated; ChatGPT scores are
+estimates. Raise -t for precision, lower it for recall. Exit status: 0 matches found, 1 none, 2
 error.

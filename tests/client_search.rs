@@ -168,6 +168,14 @@ fn token_limit_splits_chunk_and_retries_halves() {
 }
 
 #[test]
+fn token_limit_on_single_line_is_an_error_instead_of_empty_success() {
+    let files = scratch("unsplittable", &[("one.py", "needle = 1\n".into())]);
+    let c = client(Config::default(), |_| status(413, "context limit"));
+    let result = search(&c, &queries(&["needle"]), &files, &Options::default(), |_, _| {}, |_| {});
+    assert!(matches!(result, Err(JevError::TokenLimit(_))));
+}
+
+#[test]
 fn retries_on_429_then_succeeds_and_limiter_recovers() {
     let calls = Arc::new(AtomicUsize::new(0));
     let seen = calls.clone();

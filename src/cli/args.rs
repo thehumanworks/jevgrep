@@ -4,7 +4,15 @@ use std::ffi::OsString;
 
 use clap::{error::ErrorKind, ColorChoice, Parser, ValueEnum};
 
+use crate::chatgpt::{CHATGPT_MODEL, DEFAULT_CHATGPT_URL};
 use crate::client::{DEFAULT_BASE_URL, DEFAULT_MODEL};
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+pub enum BackendKind {
+    #[default]
+    Jev,
+    Chatgpt,
+}
 
 /// Application presentation policy. Clap's own help and errors always remain plain.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
@@ -42,6 +50,8 @@ pub struct Args {
     pub hidden: bool,
     pub no_ignore: bool,
     pub quiet: bool,
+    pub backend: BackendKind,
+    pub chatgpt_login: bool,
     pub model: String,
     pub base_url: String,
     pub color: ColorMode,
@@ -57,6 +67,11 @@ pub enum Parsed {
 const EXTENDED_HELP: &str = r#"environment:
   TYPESAFE_API_KEY        API key. When unset, jg tries `fnox get TYPESAFE_API_KEY`.
   JG_NO_FNOX             When set, disable the fnox key lookup.
+  JG_BACKEND             Backend when --backend is absent: jev (default) or chatgpt.
+  CHATGPT_ACCOUNT_ID     ChatGPT account; set together with CHATGPT_ACCESS_TOKEN.
+  CHATGPT_ACCESS_TOKEN   ChatGPT subscription access token (not an OpenAI API key).
+  CODEX_HOME             Codex cache directory (default: ~/.codex); reads auth.json.
+                         ChatGPT also checks $XDG_CONFIG_HOME/auth.toml (~/.config).
   JG_MODEL               Model when --model is absent; empty means the default.
   JG_BASE_URL            Endpoint when --base-url is absent; empty means the default.
   JG_DEBUG               When set, log retry reasons.
@@ -75,6 +90,18 @@ examples:
   jg --json "where is the retry budget set" | jq .
   jg "where are requests retried" --filter "Source code only. No tests or documentation"
   jg "where is the timeout set" --not tests --not "command line interface"
+  jg --backend chatgpt "where are retries handled" src/
+  jg --backend chatgpt --chatgpt-login "where is configuration loaded"
+
+chatgpt:
+  Sends Responses requests directly using your ChatGPT subscription. Uses gpt-5.6-luna,
+  requests priority (fast) service, and returns the same output format as Jev.
+  Credential order: environment pair, auth.toml, then ~/.codex/auth.json (or CODEX_HOME).
+  --chatgpt-login explicitly runs Codex device login; inference never launches Codex.
+  Scores are model estimates; Jev's calibration and per-token pricing do not apply.
+
+jev:
+  Default endpoint: https://api.typesafe.ai/v1/systemone
 
 filters:
   --filter takes plain language. jg splits it into categories and asks Jev one positive question
@@ -94,15 +121,15 @@ Only rows that clear -t are printed, and no source line is printed twice. A line
 when its surrounding block does not; it is then listed on its own, without a region row. A broad
 query ("how does auth work") has no single answering line, so it returns regions only. Files that
 look related overall but hold nothing above -t are listed last, under a "weaker" separator, and
-only with near misses (at least 0.7 x -t). Probabilities are calibrated: 0.9 means right about 9
-times in 10. Raise -t for precision, lower it for recall. Exit status: 0 matches found, 1 none, 2 error.
+only with near misses (at least 0.7 x -t). Jev probabilities are calibrated; ChatGPT scores are
+estimates. Raise -t for precision, lower it for recall. Exit status: 0 matches found, 1 none, 2 error.
 "#;
 
 #[derive(Debug, Parser)]
 #[command(
     name = "jg",
     version,
-    about = "jevgrep: search code with a natural-language query. Every file chunk is scored line by line by TypeSafe's Jev model, in parallel.",
+    about = "jevgrep: search code with a natural-language query. Score files, regions and lines with Jev or ChatGPT, in parallel.",
     color = ColorChoice::Never,
     term_width = 100,
     args_override_self = true,
@@ -157,7 +184,7 @@ struct CommandLine {
     /// Skip files matching GLOB (repeatable)
     #[arg(short = 'x', long, value_name = "GLOB", allow_hyphen_values = true)]
     exclude: Vec<String>,
-    /// Concurrent Jev requests
+    /// Concurrent requests
     #[arg(short = 'j', long, value_name = "N", default_value_t = 32, value_parser = positive_usize, allow_hyphen_values = true)]
     jobs: usize,
     /// JSON lines, one object per matching file
@@ -166,7 +193,7 @@ struct CommandLine {
     /// Flat output: path:START-END:prob:label or path:LINE:prob:text; no weaker tier
     #[arg(long)]
     no_heading: bool,
-    /// Pre-filter files by path with Jev first (automatic above --max-files)
+    /// Pre-filter files by path first (automatic above --max-files)
     #[arg(long)]
     triage: bool,
     /// File cap before path triage kicks in
@@ -175,7 +202,7 @@ struct CommandLine {
     /// Skip files larger than BYTES
     #[arg(long, value_name = "BYTES", default_value_t = 512_000, allow_hyphen_values = true)]
     max_filesize: u64,
-    /// Lines per Jev request
+    /// Most lines per request (ChatGPT may use fewer)
     #[arg(long, value_name = "N", default_value_t = 150, value_parser = positive_usize, allow_hyphen_values = true)]
     chunk_lines: usize,
     /// Include dotfiles
@@ -187,10 +214,16 @@ struct CommandLine {
     /// No progress or stats on stderr
     #[arg(short = 'q', long)]
     quiet: bool,
-    /// Jev model (default: jev-latest, or $JG_MODEL)
+    /// Decision backend (default: jev, or $JG_BACKEND)
+    #[arg(long, value_name = "BACKEND", value_enum)]
+    backend: Option<BackendKind>,
+    /// Run Codex device login for ChatGPT credentials before searching
+    #[arg(long)]
+    chatgpt_login: bool,
+    /// Model (Jev: jev-latest or $JG_MODEL; ChatGPT: gpt-5.6-luna only)
     #[arg(long, value_name = "MODEL", allow_hyphen_values = true)]
     model: Option<String>,
-    /// API endpoint (default: https://api.typesafe.ai/v1/systemone, or $JG_BASE_URL)
+    /// Override the selected backend's endpoint (or $JG_BASE_URL)
     #[arg(long, value_name = "URL", allow_hyphen_values = true)]
     base_url: Option<String>,
     /// Color eligible human output; JSON, flat output, help and usage errors remain plain
@@ -230,9 +263,25 @@ fn parse_args_with_env(argv: Vec<OsString>, mut env: impl FnMut(&str) -> Option<
         }
         Err(error) => return Err(error.to_string()),
     };
-    let model = raw.model.unwrap_or_else(|| env("JG_MODEL").filter(|v| !v.is_empty()).unwrap_or_else(|| DEFAULT_MODEL.to_owned()));
-    let base_url =
-        raw.base_url.unwrap_or_else(|| env("JG_BASE_URL").filter(|v| !v.is_empty()).unwrap_or_else(|| DEFAULT_BASE_URL.to_owned()));
+    let backend = match raw.backend {
+        Some(backend) => backend,
+        None => match env("JG_BACKEND").filter(|v| !v.is_empty()) {
+            Some(value) => BackendKind::from_str(&value, false).map_err(|_| "error: JG_BACKEND must be jev or chatgpt\n".to_owned())?,
+            None => BackendKind::default(),
+        },
+    };
+    let (default_model, default_url) = match backend {
+        BackendKind::Jev => (DEFAULT_MODEL, DEFAULT_BASE_URL),
+        BackendKind::Chatgpt => (CHATGPT_MODEL, DEFAULT_CHATGPT_URL),
+    };
+    let model = raw.model.unwrap_or_else(|| env("JG_MODEL").filter(|v| !v.is_empty()).unwrap_or_else(|| default_model.to_owned()));
+    if backend == BackendKind::Chatgpt && model != CHATGPT_MODEL {
+        return Err(format!("error: the ChatGPT backend requires model {CHATGPT_MODEL}; remove --model or JG_MODEL\n"));
+    }
+    if raw.chatgpt_login && backend != BackendKind::Chatgpt {
+        return Err("error: --chatgpt-login requires --backend chatgpt\n".to_owned());
+    }
+    let base_url = raw.base_url.unwrap_or_else(|| env("JG_BASE_URL").filter(|v| !v.is_empty()).unwrap_or_else(|| default_url.to_owned()));
     Ok(Parsed::Run(Box::new(Args {
         queries: std::iter::once(raw.query).chain(raw.extra).map(|q| q.trim().to_owned()).filter(|q| !q.is_empty()).collect(),
         paths: raw.paths,
@@ -259,6 +308,8 @@ fn parse_args_with_env(argv: Vec<OsString>, mut env: impl FnMut(&str) -> Option<
         hidden: raw.hidden,
         no_ignore: raw.no_ignore,
         quiet: raw.quiet,
+        backend,
+        chatgpt_login: raw.chatgpt_login,
         model,
         base_url,
         color: raw.color,
@@ -309,6 +360,8 @@ mod tests {
         assert_eq!((a.jobs, a.max_files, a.max_filesize, a.chunk_lines), (32, 1500, 512_000, 150));
         assert_eq!((a.model.as_str(), a.base_url.as_str()), (DEFAULT_MODEL, DEFAULT_BASE_URL));
         assert_eq!(a.color, ColorMode::Auto);
+        assert_eq!(a.backend, BackendKind::Jev);
+        assert!(!a.chatgpt_login);
         assert_eq!(ColorMode::default(), ColorMode::Auto);
     }
 
@@ -342,6 +395,8 @@ mod tests {
             ("hidden", None),
             ("no-ignore", None),
             ("quiet", Some('q')),
+            ("backend", None),
+            ("chatgpt-login", None),
             ("model", None),
             ("base-url", None),
             ("color", None),
@@ -597,7 +652,7 @@ mod tests {
     fn environment_precedence_and_empty_fallback_are_explicit() {
         for environment in [None, Some(""), Some(" "), Some("configured")] {
             for explicit in [None, Some(""), Some("flag")] {
-                let mut words = vec!["q"];
+                let mut words = vec!["q", "--backend", "jev"];
                 if let Some(value) = explicit {
                     words.extend(["--model", value, "--base-url", value]);
                 }
@@ -618,7 +673,7 @@ mod tests {
                 }
             }
         }
-        let Parsed::Run(a) = parse_args_with_env(argv(&["q", "--model", "explicit"]), |name| {
+        let Parsed::Run(a) = parse_args_with_env(argv(&["q", "--backend", "jev", "--model", "explicit"]), |name| {
             assert_eq!(name, "JG_BASE_URL");
             Some("endpoint".into())
         })
@@ -626,6 +681,36 @@ mod tests {
             panic!("expected Run")
         };
         assert_eq!((a.model.as_str(), a.base_url.as_str()), ("explicit", "endpoint"));
+    }
+
+    #[test]
+    fn backend_selection_controls_defaults_and_validates_fixed_chatgpt_model() {
+        let a = run(&["q", "--backend", "chatgpt"]);
+        assert_eq!(a.backend, BackendKind::Chatgpt);
+        assert_eq!((a.model.as_str(), a.base_url.as_str(), a.jobs), (CHATGPT_MODEL, DEFAULT_CHATGPT_URL, 32));
+        let a = run(&["q", "--backend", "chatgpt", "--jobs=3", "--chatgpt-login", "--model", CHATGPT_MODEL]);
+        assert!(a.chatgpt_login);
+        assert_eq!(a.jobs, 3);
+        assert!(parse(&["q", "--chatgpt-login"]).unwrap_err().contains("--backend chatgpt"));
+        assert!(parse(&["q", "--backend", "chatgpt", "--model", "other"]).unwrap_err().contains(CHATGPT_MODEL));
+        for value in ["", "other", "CHATGPT"] {
+            assert!(parse(&["q", "--backend", value]).is_err());
+        }
+        let Parsed::Run(a) = parse_args_with_env(argv(&["q"]), |key| (key == "JG_BACKEND").then(|| "chatgpt".into())).unwrap() else {
+            panic!("expected Run")
+        };
+        assert_eq!(a.backend, BackendKind::Chatgpt);
+        assert_eq!(a.model, CHATGPT_MODEL);
+        assert!(parse_args_with_env(argv(&["q"]), |key| match key {
+            "JG_BACKEND" => Some("chatgpt".into()),
+            "JG_MODEL" => Some("jev-latest".into()),
+            _ => None,
+        })
+        .unwrap_err()
+        .contains(CHATGPT_MODEL));
+        let Parsed::Run(a) = parse_args_with_env(argv(&["q", "--backend", "jev"]), |_| None).unwrap() else { panic!("expected Run") };
+        assert_eq!(a.backend, BackendKind::Jev);
+        assert!(parse_args_with_env(argv(&["q"]), |key| (key == "JG_BACKEND").then(|| "unknown".into())).is_err());
     }
 
     #[test]
