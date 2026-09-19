@@ -15,7 +15,8 @@ use std::time::Duration;
 
 use serde_json::{json, Map, Value};
 
-use crate::client::{AdaptiveLimiter, JevError, Reply, Transport, Usage};
+use crate::answers::{budgeted_schema, decode_answers, wire_id};
+use crate::client::{validate_bearer_url, AdaptiveLimiter, JevError, Reply, Transport, Usage};
 
 pub const DEFAULT_CHATGPT_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 pub const CHATGPT_MODEL: &str = "gpt-5.6-luna";
@@ -29,13 +30,7 @@ const SERVICE_TIER: &str = "priority";
 /// is faster still but not the same: it rated a bare `__all__` export list a direct hit for a
 /// query that only shares a name with it, which put the wrong file first in a whole-corpus run.
 const REASONING_EFFORT: &str = "low";
-/// A probability list has to sum to one, give or take the model's rounding to whole percentages.
-const PROBABILITY_SUM_TOLERANCE: f64 = 0.025;
 const RETRYABLE: &[u16] = &[408, 409, 425, 429, 500, 502, 503, 504, 529];
-/// The structured-output schema tops out here. Hitting it is a `TokenLimit`, so callers that can
-/// split their questions (search.rs splits the chunk) do so instead of failing.
-const MAX_SCHEMA_PROPERTIES: usize = 5000;
-const MAX_SCHEMA_STRING_CHARS: usize = 120_000;
 /// The only server-supplied strings we ever repeat back. A shape test cannot separate an error
 /// code from a secret — an API token is alphanumeric with hyphens too — so the set is fixed here
 /// and anything outside it is reported as undisclosed. Add to this list, never relax the check.
@@ -108,128 +103,17 @@ fn jitter() -> f64 {
     (x >> 11) as f64 / (1u64 << 53) as f64
 }
 
-/// Bearer credentials must not travel over plaintext. Loopback is allowed so that tests and local
-/// mocks can point the client at an ordinary HTTP server.
-///
-/// The URL is parsed rather than scanned, because `http://localhost@evil.example/` reads as
-/// loopback to anything that splits on punctuation while ureq would dial `evil.example`. The
-/// offending URL is never quoted back: a mistyped base URL can carry a token in its query string.
+/// Bearer credentials must not travel over plaintext; see `validate_bearer_url`.
 fn validate_url(url: &str) -> Result<(), String> {
-    let rejected = |why: &str| Err(format!("refusing to send ChatGPT credentials to the configured base URL: {why}"));
-    let Ok(uri) = url.parse::<ureq::http::Uri>() else {
-        return rejected("it is not a valid URL");
-    };
-    let Some(authority) = uri.authority() else {
-        return rejected("it has no host");
-    };
-    // `user:pass@host` makes the host we vet differ from the host that is dialled.
-    if authority.as_str().contains('@') {
-        return rejected("it carries userinfo before the host");
-    }
-    let host = authority.host().trim_start_matches('[').trim_end_matches(']');
-    match uri.scheme_str() {
-        Some("https") if !host.is_empty() => Ok(()),
-        Some("http") if matches!(host, "localhost" | "127.0.0.1" | "::1") => Ok(()),
-        Some("http") => rejected("plaintext http is only allowed on localhost"),
-        _ => rejected("only https, or http on localhost, is allowed"),
-    }
+    validate_bearer_url("ChatGPT", url)
 }
 
 // ---------------------------------------------------------------------------------------------
-// Schema
+// Request
 // ---------------------------------------------------------------------------------------------
-
-/// A strict-mode object: every declared property is required and nothing else may appear.
-fn strict_object(properties: Map<String, Value>) -> Value {
-    let required: Vec<Value> = properties.keys().map(|k| json!(k)).collect();
-    json!({"type": "object", "additionalProperties": false, "required": required, "properties": properties})
-}
-
-fn props(pairs: impl IntoIterator<Item = (&'static str, Value)>) -> Map<String, Value> {
-    pairs.into_iter().map(|(k, v)| (k.to_owned(), v)).collect()
-}
-
-/// `criteria` as a list of level descriptions, or a clear error.
-fn criteria_of(qid: &str, question: &Value) -> Result<Vec<String>, JevError> {
-    let listed = question
-        .get("criteria")
-        .and_then(Value::as_array)
-        .ok_or_else(|| JevError::Api(format!("question `{qid}` is type `score` but has no `criteria` array")))?;
-    let criteria: Option<Vec<String>> = listed.iter().map(|c| c.as_str().map(str::to_owned)).collect();
-    match criteria {
-        Some(criteria) if !criteria.is_empty() => Ok(criteria),
-        Some(_) => Err(JevError::Api(format!("question `{qid}` has an empty `criteria` array"))),
-        None => Err(JevError::Api(format!("question `{qid}` has non-string entries in `criteria`"))),
-    }
-}
-
-/// An integer percentage. The bounds are declared as well as checked: a live probe confirmed this
-/// endpoint honours `minimum`/`maximum` under strict mode, and the range checks in `decode_answer`
-/// still stand behind them.
-fn percentage() -> Value {
-    json!({"type": "integer", "minimum": 0, "maximum": 100})
-}
-
-/// The schema for one answer, in the terse wire shape `INSTRUCTIONS` describes.
-fn answer_schema(qid: &str, question: &Value) -> Result<Value, JevError> {
-    match question.get("type").and_then(Value::as_str) {
-        Some("noul") => Ok(percentage()),
-        Some("score") => {
-            let levels = criteria_of(qid, question)?.len();
-            let probabilities = json!({"type": "array", "items": percentage(), "minItems": levels, "maxItems": levels});
-            Ok(strict_object(props([("confidence", percentage()), ("probabilities", probabilities)])))
-        }
-        Some(other) => {
-            Err(JevError::Api(format!("question `{qid}` has unsupported type `{other}`; the ChatGPT backend answers `noul` and `score`")))
-        }
-        None => Err(JevError::Api(format!("question `{qid}` has no `type`"))),
-    }
-}
-
-/// The id a question travels under: its position in the caller's map. Every answer repeats its id,
-/// so `q0.L117` on the wire would be paid for in output tokens once per line of source.
-fn wire_id(index: usize) -> String {
-    index.to_string()
-}
-
-/// The whole response schema: `{"answers": {<wire id>: <answer>, ...}}`.
-fn request_schema(questions: &Map<String, Value>) -> Result<Value, JevError> {
-    let mut answers = Map::new();
-    for (index, (qid, question)) in questions.iter().enumerate() {
-        answers.insert(wire_id(index), answer_schema(qid, question)?);
-    }
-    Ok(strict_object(props([("answers", strict_object(answers))])))
-}
-
-/// Every property the schema declares, at any depth, and the characters their names take. These
-/// are what the model's schema limits count; the terse schema declares no enums.
-fn schema_budget(schema: &Value) -> (usize, usize) {
-    let mut budget = (0, 0);
-    if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
-        budget.0 += properties.len();
-        for (name, child) in properties {
-            let (properties, chars) = schema_budget(child);
-            budget.0 += properties;
-            budget.1 += name.chars().count() + chars;
-        }
-    }
-    budget
-}
 
 fn request_body(state: &Value, questions: &Map<String, Value>) -> Result<Vec<u8>, JevError> {
-    let schema = request_schema(questions)?;
-    let (declared, chars) = schema_budget(&schema);
-    if declared > MAX_SCHEMA_PROPERTIES {
-        return Err(JevError::TokenLimit(format!(
-            "{} questions need {declared} schema properties, over the {MAX_SCHEMA_PROPERTIES} limit; ask fewer questions per request",
-            questions.len()
-        )));
-    }
-    if chars > MAX_SCHEMA_STRING_CHARS {
-        return Err(JevError::TokenLimit(format!(
-            "response schema needs {chars} string characters, over the {MAX_SCHEMA_STRING_CHARS} limit; ask fewer questions per request"
-        )));
-    }
+    let schema = budgeted_schema(questions)?;
     let asked: Map<String, Value> = questions.values().enumerate().map(|(index, question)| (wire_id(index), question.clone())).collect();
     let text = serde_json::to_string(&json!({"state": state, "questions": asked})).map_err(|e| JevError::Api(e.to_string()))?;
     let body = json!({
@@ -243,103 +127,6 @@ fn request_body(state: &Value, questions: &Map<String, Value>) -> Result<Vec<u8>
         "text": {"format": {"type": "json_schema", "name": "jev_answers", "strict": true, "schema": schema}},
     });
     serde_json::to_vec(&body).map_err(|e| JevError::Api(e.to_string()))
-}
-
-// ---------------------------------------------------------------------------------------------
-// Answer validation
-// ---------------------------------------------------------------------------------------------
-
-/// A percentage from the wire as a probability, if it is one.
-fn probability(value: Option<&Value>) -> Option<f64> {
-    value.and_then(Value::as_f64).filter(|n| n.is_finite() && (0.0..=100.0).contains(n)).map(|n| n / 100.0)
-}
-
-/// Lists ids in an error without letting a large request turn into a wall of text.
-fn sample(ids: &[&String]) -> String {
-    let shown = ids.iter().take(5).map(|s| s.as_str()).collect::<Vec<_>>().join(", ");
-    if ids.len() > 5 {
-        format!("{shown}, and {} more", ids.len() - 5)
-    } else {
-        shown
-    }
-}
-
-/// One wire answer, checked and rebuilt into the shape Jev returns.
-///
-/// Every diagnostic here is built from the question the caller asked, never from what came back.
-/// A wrong answer can contain the user's own source, or anything else the model chose to emit.
-fn decode_answer(qid: &str, question: &Value, answer: &Value) -> Result<Value, JevError> {
-    let wrong = |what: String| Err(JevError::Api(format!("answer for `{qid}` {what}")));
-    match question.get("type").and_then(Value::as_str).unwrap_or_default() {
-        "noul" => match probability(Some(answer)) {
-            Some(p) => return Ok(json!({"type": "noul", "noul": p})),
-            None => return wrong("is not a percentage in 0..=100".to_owned()),
-        },
-        "score" => {}
-        // `answer_schema` refused anything else before the request went out.
-        other => return wrong(format!("has the unsupported type `{other}`")),
-    }
-
-    let criteria = criteria_of(qid, question)?;
-    // Strict mode forbids extra properties, so an answer carrying any is not schema-conformant.
-    if answer.as_object().is_none_or(|object| object.len() != 2) {
-        return wrong("does not have exactly the fields `confidence` and `probabilities`".to_owned());
-    }
-    let Some(confidence) = probability(answer.get("confidence")) else {
-        return wrong("has no `confidence` percentage in 0..=100".to_owned());
-    };
-    let listed = answer.get("probabilities").and_then(Value::as_array).filter(|listed| listed.len() == criteria.len());
-    let Some(listed) = listed else {
-        return wrong(format!("has no `probabilities` array of exactly {} percentages", criteria.len()));
-    };
-    let Some(levels) = listed.iter().map(|p| probability(Some(p))).collect::<Option<Vec<f64>>>() else {
-        return wrong("has a `probabilities` value outside 0..=100".to_owned());
-    };
-    let total: f64 = levels.iter().sum();
-    if (total - 1.0).abs() > PROBABILITY_SUM_TOLERANCE {
-        return wrong(format!("has `probabilities` summing to {:.0} rather than 100", total * 100.0));
-    }
-    // `score` is the mean the distribution implies. Computing it here leaves the model no way to
-    // report a score that contradicts its own probabilities.
-    let score = levels.iter().enumerate().map(|(index, p)| p * index as f64).sum::<f64>() / total;
-    let indexed = |values: &mut dyn Iterator<Item = Value>| -> Map<String, Value> {
-        values.enumerate().map(|(index, value)| (index.to_string(), value)).collect()
-    };
-    Ok(json!({
-        "type": "score",
-        "score": score,
-        "confidence": confidence,
-        "probabilities": indexed(&mut levels.iter().map(|p| json!(p))),
-        "legend": indexed(&mut criteria.iter().map(|text| json!(text))),
-    }))
-}
-
-/// Accepts the model's `answers` object only if it matches the questions exactly, and hands it
-/// back keyed by the caller's ids.
-///
-/// Unanswered ids are named, because they come from the caller's own question map. Unexpected ids
-/// are only counted: those strings came from the model.
-fn decode_answers(questions: &Map<String, Value>, answers: &Map<String, Value>) -> Result<Map<String, Value>, JevError> {
-    let missing: Vec<&String> =
-        questions.keys().enumerate().filter(|(index, _)| !answers.contains_key(&wire_id(*index))).map(|(_, qid)| qid).collect();
-    if !missing.is_empty() {
-        return Err(JevError::Api(format!(
-            "model left {} of {} questions unanswered: {}",
-            missing.len(),
-            questions.len(),
-            sample(&missing)
-        )));
-    }
-    // Every wire id is present, so anything beyond that count was not asked.
-    let extra = answers.len() - questions.len();
-    if extra > 0 {
-        return Err(JevError::Api(format!("model returned {extra} answer(s) to questions that were not asked")));
-    }
-    questions
-        .iter()
-        .enumerate()
-        .map(|(index, (qid, question))| Ok((qid.clone(), decode_answer(qid, question, &answers[&wire_id(index)])?)))
-        .collect()
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -829,6 +616,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
+    use crate::answers::{request_schema, schema_budget};
 
     const CRITERIA: [&str; 3] = ["Irrelevant", "Relevant", "Direct hit"];
 

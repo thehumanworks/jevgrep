@@ -4,7 +4,7 @@ mod args;
 mod progress;
 mod render;
 
-pub use args::{parse_args, Args, BackendKind, ColorMode, Parsed};
+pub use args::{parse_args, ApiKey, Args, BackendKind, ColorMode, Parsed};
 pub use render::{render_files, render_json, render_text};
 
 use std::ffi::OsString;
@@ -18,6 +18,7 @@ use crate::chatgpt_auth::{device_login, resolve_credentials};
 use crate::client::{resolve_api_key, Config, JevClient, JevError};
 use crate::files::{discover, Discover};
 use crate::filters::{parse_filter, Rules};
+use crate::openai_compat::{ChatClient, ChatConfig};
 use crate::results::{filtered_out, select, select_files, Limits};
 use crate::search::{search, Options};
 use progress::Progress;
@@ -150,9 +151,10 @@ fn execute(args: &Args, out: &mut dyn Write) -> io::Result<i32> {
             return Ok(2);
         }
         Err(e) => {
-            let provider = match args.backend {
-                BackendKind::Jev => "TypeSafe",
-                BackendKind::Chatgpt => "ChatGPT",
+            let provider = match (args.backend, args.backend.provider()) {
+                (_, Some(provider)) => provider.label(&args.base_url),
+                (BackendKind::Chatgpt, None) => "ChatGPT".to_owned(),
+                (_, None) => "TypeSafe".to_owned(),
             };
             eprintln!("jg: {}", diagnostics.notice(format!("{provider} API error: {e}")));
             return Ok(2);
@@ -221,6 +223,20 @@ fn execute(args: &Args, out: &mut dyn Write) -> io::Result<i32> {
                 client.service_tier().as_deref().unwrap_or("unreported"),
                 started.elapsed().as_secs_f64()
             ),
+            BackendKind::Openrouter | BackendKind::Openai => {
+                // A cost is shown only where the service states one; jg knows no price list.
+                let cost = client.reported_cost_usd().map(|usd| format!("; reported cost ${usd:.4}")).unwrap_or_default();
+                eprintln!(
+                    "jg: {} files, {} requests{retries}, {} input / {} output tokens ({} {}{cost}), {:.1}s",
+                    files.len(),
+                    usage.requests(),
+                    thousands(usage.input_tokens()),
+                    thousands(usage.output_tokens()),
+                    args.backend.provider().map(|provider| provider.label(&args.base_url)).unwrap_or_default(),
+                    args.model,
+                    started.elapsed().as_secs_f64()
+                )
+            }
         }
     }
     Ok(if any { 0 } else { 1 })
@@ -245,6 +261,28 @@ fn build_backend(args: &Args, progress: &Arc<Progress>) -> Result<Box<dyn Decisi
             let credentials = if args.chatgpt_login { device_login()? } else { resolve_credentials()? };
             let cfg = ChatGptConfig { base_url: args.base_url.clone(), pool_size: args.jobs, ..ChatGptConfig::default() };
             let mut client = ChatGptClient::new(&credentials, cfg);
+            if debug {
+                client.set_debug_reporter(reporter);
+            }
+            Ok(Box::new(client))
+        }
+        BackendKind::Openrouter | BackendKind::Openai => {
+            let provider = args.backend.provider().expect("every OpenAI-compatible backend has a preset");
+            let key = provider.resolve_key(
+                &args.base_url,
+                args.api_key.as_ref().map(|key| key.0.as_str()),
+                args.api_key_env.as_deref(),
+                |name| std::env::var(name).ok(),
+            )?;
+            let cfg = ChatConfig {
+                base_url: args.base_url.clone(),
+                model: args.model.clone(),
+                json_schema: args.json_schema,
+                extra_body: args.extra_body.clone(),
+                pool_size: args.jobs,
+                ..ChatConfig::new(provider)
+            };
+            let mut client = ChatClient::new(key.as_deref(), cfg);
             if debug {
                 client.set_debug_reporter(reporter);
             }

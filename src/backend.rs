@@ -8,6 +8,7 @@ use serde_json::{Map, Value};
 
 use crate::chatgpt::ChatGptClient;
 use crate::client::{JevClient, Usage};
+use crate::openai_compat::ChatClient;
 
 /// Provider-independent error name; the original `JevError` remains compatible.
 pub use crate::client::JevError as DecisionError;
@@ -20,6 +21,11 @@ pub trait DecisionBackend: Send + Sync {
 
     /// Effective service tier reported by the provider, when available.
     fn service_tier(&self) -> Option<String> {
+        None
+    }
+
+    /// What the provider itself says the requests cost, in dollars, when it reports one.
+    fn reported_cost_usd(&self) -> Option<f64> {
         None
     }
 
@@ -56,4 +62,23 @@ impl DecisionBackend for ChatGptClient {
     fn answers_sequentially(&self) -> bool {
         true
     }
+}
+
+impl DecisionBackend for ChatClient {
+    fn ask(&self, state: &Value, questions: &Map<String, Value>) -> Result<Map<String, Value>, DecisionError> {
+        ChatClient::ask(self, state, questions)
+    }
+
+    fn usage(&self) -> &Usage {
+        &self.usage
+    }
+
+    fn reported_cost_usd(&self) -> Option<f64> {
+        self.cost_usd()
+    }
+
+    // `answers_sequentially` stays false although these models do write token by token: spreading
+    // a search over more, smaller requests buys latency with requests, and requests are what
+    // hosted services ration (OpenRouter free models: 20 a minute, and 50 or 1000 a day) and what
+    // a local server queues. Measured live, spread turned a two-file search from 5 requests into 22.
 }

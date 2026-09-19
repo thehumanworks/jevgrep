@@ -48,9 +48,14 @@ pub struct Usage {
 impl Usage {
     pub(crate) fn add(&self, usage: Option<&Value>) {
         let field = |k: &str| usage.and_then(|u| u.get(k)).and_then(Value::as_u64).unwrap_or(0);
+        self.add_counts(field("input_tokens"), field("output_tokens"));
+    }
+
+    /// One request's tokens, for providers that name the fields differently.
+    pub(crate) fn add_counts(&self, input_tokens: u64, output_tokens: u64) {
         self.requests.fetch_add(1, Ordering::Relaxed);
-        self.input_tokens.fetch_add(field("input_tokens"), Ordering::Relaxed);
-        self.output_tokens.fetch_add(field("output_tokens"), Ordering::Relaxed);
+        self.input_tokens.fetch_add(input_tokens, Ordering::Relaxed);
+        self.output_tokens.fetch_add(output_tokens, Ordering::Relaxed);
     }
 
     pub(crate) fn add_retry(&self) {
@@ -79,7 +84,7 @@ impl Usage {
 }
 
 /// Uniform in [0, 1). Only used for retry jitter, so a tiny xorshift is plenty.
-fn jitter() -> f64 {
+pub(crate) fn jitter() -> f64 {
     static STATE: AtomicU64 = AtomicU64::new(0);
     let mut x = STATE.load(Ordering::Relaxed);
     if x == 0 {
@@ -199,6 +204,48 @@ fn fnox_key() -> Option<String> {
     let out = child.wait_with_output().ok()?;
     let key = String::from_utf8_lossy(&out.stdout).trim().to_owned();
     (out.status.success() && !key.is_empty()).then_some(key)
+}
+
+/// Bearer credentials must not travel over plaintext. Loopback is allowed so that tests and local
+/// mocks can point the client at an ordinary HTTP server.
+///
+/// The URL is parsed rather than scanned, because `http://localhost@evil.example/` reads as
+/// loopback to anything that splits on punctuation while ureq would dial `evil.example`. The
+/// offending URL is never quoted back: a mistyped base URL can carry a token in its query string.
+pub(crate) fn validate_bearer_url(provider: &str, url: &str) -> Result<(), String> {
+    validate_url(url, Some(provider))
+}
+
+/// The same parse for a request that carries no credentials, such as one to a keyless server on
+/// the local network. With nothing to protect, plaintext http to any host is the caller's choice.
+pub(crate) fn validate_keyless_url(url: &str) -> Result<(), String> {
+    validate_url(url, None)
+}
+
+fn validate_url(url: &str, credentials_of: Option<&str>) -> Result<(), String> {
+    let rejected = |why: &str| match credentials_of {
+        Some(provider) => Err(format!("refusing to send {provider} credentials to the configured base URL: {why}")),
+        None => Err(format!("cannot use the configured base URL: {why}")),
+    };
+    let Ok(uri) = url.parse::<ureq::http::Uri>() else {
+        return rejected("it is not a valid URL");
+    };
+    let Some(authority) = uri.authority() else {
+        return rejected("it has no host");
+    };
+    // `user:pass@host` makes the host we vet differ from the host that is dialled.
+    if authority.as_str().contains('@') {
+        return rejected("it carries userinfo before the host");
+    }
+    let host = authority.host().trim_start_matches('[').trim_end_matches(']');
+    match uri.scheme_str() {
+        Some("https") if !host.is_empty() => Ok(()),
+        Some("http") if matches!(host, "localhost" | "127.0.0.1" | "::1") => Ok(()),
+        Some("http") if credentials_of.is_none() && !host.is_empty() => Ok(()),
+        Some("http") => rejected("plaintext http is only allowed on localhost"),
+        _ if credentials_of.is_none() => rejected("only http and https are supported"),
+        _ => rejected("only https, or http on localhost, is allowed"),
+    }
 }
 
 /// What came back from one HTTP POST.

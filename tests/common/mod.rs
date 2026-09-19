@@ -42,6 +42,9 @@ pub fn answer_all(body: &Value, hot: &[&str]) -> String {
 }
 
 pub struct Request {
+    /// The request target, e.g. `/v1/systemone`.
+    pub path: String,
+    /// Empty when no `Authorization` header was sent.
     pub authorization: String,
     pub body: Value,
 }
@@ -62,6 +65,7 @@ pub fn serve(handler: impl Fn(&Request) -> (u16, String) + Send + Sync + 'static
                     if reader.read_line(&mut line).unwrap_or(0) == 0 {
                         return; // client closed the connection
                     }
+                    let path = line.split_whitespace().nth(1).unwrap_or_default().to_owned();
                     loop {
                         line.clear();
                         if reader.read_line(&mut line).unwrap_or(0) == 0 || line.trim().is_empty() {
@@ -79,7 +83,7 @@ pub fn serve(handler: impl Fn(&Request) -> (u16, String) + Send + Sync + 'static
                     if reader.read_exact(&mut raw).is_err() {
                         return;
                     }
-                    let request = Request { authorization, body: serde_json::from_slice(&raw).unwrap_or(Value::Null) };
+                    let request = Request { path, authorization, body: serde_json::from_slice(&raw).unwrap_or(Value::Null) };
                     let (status, text) = handler(&request);
                     let head = format!("HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n", text.len());
                     if stream.write_all(head.as_bytes()).and_then(|()| stream.write_all(text.as_bytes())).is_err() {

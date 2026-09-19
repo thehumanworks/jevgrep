@@ -1,5 +1,5 @@
-jevgrep: search code with a natural-language query. Score files, regions and lines with Jev or
-ChatGPT, in parallel.
+jevgrep: search code with a natural-language query. Score files, regions and lines with Jev, ChatGPT
+or any OpenAI-compatible model, in parallel.
 
 Usage: jg [OPTIONS] <QUERY> [PATH]...
 
@@ -38,9 +38,17 @@ Options:
       --no-ignore             Do not honor .gitignore
   -q, --quiet                 No progress or stats on stderr
       --backend <BACKEND>     Decision backend (default: jev, or $JG_BACKEND) [possible values: jev,
-                              chatgpt]
+                              chatgpt, openrouter, openai]
       --chatgpt-login         Run Codex device login for ChatGPT credentials before searching
-      --model <MODEL>         Model (Jev: jev-latest or $JG_MODEL; ChatGPT: gpt-5.6-luna only)
+      --api-key <KEY>         API key for an OpenAI-compatible backend (default: the preset's
+                              variable)
+      --api-key-env <VAR>     Read that API key from the environment variable VAR instead
+      --json-schema           OpenAI-compatible: send a strict response schema (models with
+                              structured outputs only)
+      --extra-body <JSON>     OpenAI-compatible: JSON object of request fields to add or override;
+                              null removes one
+      --model <MODEL>         Model, or $JG_MODEL (Jev: jev-latest; ChatGPT: gpt-5.6-luna only;
+                              openrouter, openai: any id)
       --base-url <URL>        Override the selected backend's endpoint (or $JG_BASE_URL)
       --color <WHEN>          Color eligible human output; JSON, flat output, help and usage errors
                               remain plain [default: auto] [possible values: auto, always, never]
@@ -50,11 +58,17 @@ Options:
 environment:
   TYPESAFE_API_KEY        API key. When unset, jg tries `fnox get TYPESAFE_API_KEY`.
   JG_NO_FNOX             When set, disable the fnox key lookup.
-  JG_BACKEND             Backend when --backend is absent: jev (default) or chatgpt.
+  JG_BACKEND             Backend when --backend is absent: jev (default), chatgpt, openrouter
+                         or openai.
   CHATGPT_ACCOUNT_ID     ChatGPT account; set together with CHATGPT_ACCESS_TOKEN.
   CHATGPT_ACCESS_TOKEN   ChatGPT subscription access token (not an OpenAI API key).
   CODEX_HOME             Codex cache directory (default: ~/.codex); reads auth.json.
                          ChatGPT also checks $XDG_CONFIG_HOME/auth.toml (~/.config).
+  OPENROUTER_API_KEY     Key for --backend openrouter, unless --api-key or --api-key-env is given.
+  OPENAI_API_KEY         Key for --backend openai, likewise. As with OpenAI's SDKs, it is sent to
+                         whatever base URL is configured. fnox is never consulted for these keys.
+  OPENAI_BASE_URL        API root for --backend openai when --base-url and JG_BASE_URL are absent.
+  JG_EXTRA_BODY          Extra request fields when --extra-body is absent (openrouter, openai).
   JG_MODEL               Model when --model is absent; empty means the default.
   JG_BASE_URL            Endpoint when --base-url is absent; empty means the default.
   JG_DEBUG               When set, log retry reasons.
@@ -75,6 +89,12 @@ examples:
   jg "where is the timeout set" --not tests --not "command line interface"
   jg --backend chatgpt "where are retries handled" src/
   jg --backend chatgpt --chatgpt-login "where is configuration loaded"
+  jg --backend openrouter "where are retries handled" src/
+  jg --backend openrouter --model vendor/model "where is configuration loaded"
+  jg --backend openai --model MODEL "where is the cache invalidated"   # api.openai.com
+  jg --backend openai --base-url http://localhost:11434/v1 --model MODEL -j 2 "query"
+  jg --backend openai --base-url https://api.example.com/v1 --api-key-env EXAMPLE_API_KEY \
+     --model MODEL --extra-body '{"reasoning_effort":"low"}' "query"
 
 chatgpt:
   Sends Responses requests directly using your ChatGPT subscription. Uses gpt-5.6-luna,
@@ -82,6 +102,22 @@ chatgpt:
   Credential order: environment pair, auth.toml, then ~/.codex/auth.json (or CODEX_HOME).
   --chatgpt-login explicitly runs Codex device login; inference never launches Codex.
   Scores are model estimates; Jev's calibration and per-token pricing do not apply.
+
+openai-compatible (--backend openrouter, --backend openai):
+  One chat-completions client for any service or local server that speaks OpenAI's protocol.
+  openrouter is a preset: openrouter.ai, OPENROUTER_API_KEY, default model
+  inclusionai/ling-3.0-flash-fin:free. openai is the general case: api.openai.com unless
+  --base-url names another API root (https://host/v1) or a full /chat/completions URL; it has no
+  default model, so --model is required. Key order: --api-key, the variable named by
+  --api-key-env, then the preset's variable. Prefer a variable: --api-key shows in `ps`. openai
+  with another base URL may go without a key, as local servers do; a key is only ever sent over
+  https, or http on localhost.
+  No response schema is sent by default, since most models cannot enforce one and some reject
+  the attempt: every reply is checked locally and an unusable one is asked for again.
+  --json-schema sends the strict schema, for models with structured outputs. --extra-body
+  passes a service's own request fields through. A model that refuses `temperature` is asked
+  again without it. Rate limits are waited out for up to a minute; lower -j for small servers.
+  Scores are model estimates; stats show a cost only where the service reports one.
 
 jev:
   Default endpoint: https://api.typesafe.ai/v1/systemone
@@ -104,6 +140,6 @@ Only rows that clear -t are printed, and no source line is printed twice. A line
 when its surrounding block does not; it is then listed on its own, without a region row. A broad
 query ("how does auth work") has no single answering line, so it returns regions only. Files that
 look related overall but hold nothing above -t are listed last, under a "weaker" separator, and
-only with near misses (at least 0.7 x -t). Jev probabilities are calibrated; ChatGPT scores are
-estimates. Raise -t for precision, lower it for recall. Exit status: 0 matches found, 1 none, 2
-error.
+only with near misses (at least 0.7 x -t). Jev probabilities are calibrated; ChatGPT and
+OpenAI-compatible scores are estimates. Raise -t for precision, lower it for recall. Exit status: 0
+matches found, 1 none, 2 error.

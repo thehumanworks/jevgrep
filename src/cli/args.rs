@@ -6,12 +6,36 @@ use clap::{error::ErrorKind, ColorChoice, Parser, ValueEnum};
 
 use crate::chatgpt::{CHATGPT_MODEL, DEFAULT_CHATGPT_URL};
 use crate::client::{DEFAULT_BASE_URL, DEFAULT_MODEL};
+use crate::openai_compat::{Provider, OPENAI, OPENROUTER, RESERVED_BODY_FIELDS};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
 pub enum BackendKind {
     #[default]
     Jev,
     Chatgpt,
+    Openrouter,
+    Openai,
+}
+
+impl BackendKind {
+    /// The preset behind an OpenAI-compatible backend. A new service is one more arm here.
+    pub fn provider(self) -> Option<&'static Provider> {
+        match self {
+            BackendKind::Jev | BackendKind::Chatgpt => None,
+            BackendKind::Openrouter => Some(&OPENROUTER),
+            BackendKind::Openai => Some(&OPENAI),
+        }
+    }
+}
+
+/// A credential given on the command line. `Args` is `Debug`; the key must not be.
+#[derive(Clone, Eq, PartialEq)]
+pub struct ApiKey(pub String);
+
+impl std::fmt::Debug for ApiKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ApiKey(<redacted>)")
+    }
 }
 
 /// Application presentation policy. Clap's own help and errors always remain plain.
@@ -52,6 +76,10 @@ pub struct Args {
     pub quiet: bool,
     pub backend: BackendKind,
     pub chatgpt_login: bool,
+    pub api_key: Option<ApiKey>,
+    pub api_key_env: Option<String>,
+    pub json_schema: bool,
+    pub extra_body: serde_json::Map<String, serde_json::Value>,
     pub model: String,
     pub base_url: String,
     pub color: ColorMode,
@@ -67,11 +95,17 @@ pub enum Parsed {
 const EXTENDED_HELP: &str = r#"environment:
   TYPESAFE_API_KEY        API key. When unset, jg tries `fnox get TYPESAFE_API_KEY`.
   JG_NO_FNOX             When set, disable the fnox key lookup.
-  JG_BACKEND             Backend when --backend is absent: jev (default) or chatgpt.
+  JG_BACKEND             Backend when --backend is absent: jev (default), chatgpt, openrouter
+                         or openai.
   CHATGPT_ACCOUNT_ID     ChatGPT account; set together with CHATGPT_ACCESS_TOKEN.
   CHATGPT_ACCESS_TOKEN   ChatGPT subscription access token (not an OpenAI API key).
   CODEX_HOME             Codex cache directory (default: ~/.codex); reads auth.json.
                          ChatGPT also checks $XDG_CONFIG_HOME/auth.toml (~/.config).
+  OPENROUTER_API_KEY     Key for --backend openrouter, unless --api-key or --api-key-env is given.
+  OPENAI_API_KEY         Key for --backend openai, likewise. As with OpenAI's SDKs, it is sent to
+                         whatever base URL is configured. fnox is never consulted for these keys.
+  OPENAI_BASE_URL        API root for --backend openai when --base-url and JG_BASE_URL are absent.
+  JG_EXTRA_BODY          Extra request fields when --extra-body is absent (openrouter, openai).
   JG_MODEL               Model when --model is absent; empty means the default.
   JG_BASE_URL            Endpoint when --base-url is absent; empty means the default.
   JG_DEBUG               When set, log retry reasons.
@@ -92,6 +126,12 @@ examples:
   jg "where is the timeout set" --not tests --not "command line interface"
   jg --backend chatgpt "where are retries handled" src/
   jg --backend chatgpt --chatgpt-login "where is configuration loaded"
+  jg --backend openrouter "where are retries handled" src/
+  jg --backend openrouter --model vendor/model "where is configuration loaded"
+  jg --backend openai --model MODEL "where is the cache invalidated"   # api.openai.com
+  jg --backend openai --base-url http://localhost:11434/v1 --model MODEL -j 2 "query"
+  jg --backend openai --base-url https://api.example.com/v1 --api-key-env EXAMPLE_API_KEY \
+     --model MODEL --extra-body '{"reasoning_effort":"low"}' "query"
 
 chatgpt:
   Sends Responses requests directly using your ChatGPT subscription. Uses gpt-5.6-luna,
@@ -99,6 +139,22 @@ chatgpt:
   Credential order: environment pair, auth.toml, then ~/.codex/auth.json (or CODEX_HOME).
   --chatgpt-login explicitly runs Codex device login; inference never launches Codex.
   Scores are model estimates; Jev's calibration and per-token pricing do not apply.
+
+openai-compatible (--backend openrouter, --backend openai):
+  One chat-completions client for any service or local server that speaks OpenAI's protocol.
+  openrouter is a preset: openrouter.ai, OPENROUTER_API_KEY, default model
+  inclusionai/ling-3.0-flash-fin:free. openai is the general case: api.openai.com unless
+  --base-url names another API root (https://host/v1) or a full /chat/completions URL; it has no
+  default model, so --model is required. Key order: --api-key, the variable named by
+  --api-key-env, then the preset's variable. Prefer a variable: --api-key shows in `ps`. openai
+  with another base URL may go without a key, as local servers do; a key is only ever sent over
+  https, or http on localhost.
+  No response schema is sent by default, since most models cannot enforce one and some reject
+  the attempt: every reply is checked locally and an unusable one is asked for again.
+  --json-schema sends the strict schema, for models with structured outputs. --extra-body
+  passes a service's own request fields through. A model that refuses `temperature` is asked
+  again without it. Rate limits are waited out for up to a minute; lower -j for small servers.
+  Scores are model estimates; stats show a cost only where the service reports one.
 
 jev:
   Default endpoint: https://api.typesafe.ai/v1/systemone
@@ -121,15 +177,15 @@ Only rows that clear -t are printed, and no source line is printed twice. A line
 when its surrounding block does not; it is then listed on its own, without a region row. A broad
 query ("how does auth work") has no single answering line, so it returns regions only. Files that
 look related overall but hold nothing above -t are listed last, under a "weaker" separator, and
-only with near misses (at least 0.7 x -t). Jev probabilities are calibrated; ChatGPT scores are
-estimates. Raise -t for precision, lower it for recall. Exit status: 0 matches found, 1 none, 2 error.
+only with near misses (at least 0.7 x -t). Jev probabilities are calibrated; ChatGPT and
+OpenAI-compatible scores are estimates. Raise -t for precision, lower it for recall. Exit status: 0 matches found, 1 none, 2 error.
 "#;
 
 #[derive(Debug, Parser)]
 #[command(
     name = "jg",
     version,
-    about = "jevgrep: search code with a natural-language query. Score files, regions and lines with Jev or ChatGPT, in parallel.",
+    about = "jevgrep: search code with a natural-language query. Score files, regions and lines with Jev, ChatGPT or any OpenAI-compatible model, in parallel.",
     color = ColorChoice::Never,
     term_width = 100,
     args_override_self = true,
@@ -220,7 +276,19 @@ struct CommandLine {
     /// Run Codex device login for ChatGPT credentials before searching
     #[arg(long)]
     chatgpt_login: bool,
-    /// Model (Jev: jev-latest or $JG_MODEL; ChatGPT: gpt-5.6-luna only)
+    /// API key for an OpenAI-compatible backend (default: the preset's variable)
+    #[arg(long, value_name = "KEY", allow_hyphen_values = true, conflicts_with = "api_key_env")]
+    api_key: Option<String>,
+    /// Read that API key from the environment variable VAR instead
+    #[arg(long, value_name = "VAR", allow_hyphen_values = true)]
+    api_key_env: Option<String>,
+    /// OpenAI-compatible: send a strict response schema (models with structured outputs only)
+    #[arg(long)]
+    json_schema: bool,
+    /// OpenAI-compatible: JSON object of request fields to add or override; null removes one
+    #[arg(long, value_name = "JSON", allow_hyphen_values = true)]
+    extra_body: Option<String>,
+    /// Model, or $JG_MODEL (Jev: jev-latest; ChatGPT: gpt-5.6-luna only; openrouter, openai: any id)
     #[arg(long, value_name = "MODEL", allow_hyphen_values = true)]
     model: Option<String>,
     /// Override the selected backend's endpoint (or $JG_BASE_URL)
@@ -229,6 +297,17 @@ struct CommandLine {
     /// Color eligible human output; JSON, flat output, help and usage errors remain plain
     #[arg(long, value_name = "WHEN", value_enum, default_value = "auto", allow_hyphen_values = true)]
     color: ColorMode,
+}
+
+/// `--extra-body` as request fields. The text is never quoted back: it may hold a routing secret.
+fn parse_extra_body(text: &str) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    let Ok(serde_json::Value::Object(fields)) = serde_json::from_str(text) else {
+        return Err("error: --extra-body (or JG_EXTRA_BODY) must be a JSON object, e.g. '{\"reasoning_effort\":\"low\"}'\n".to_owned());
+    };
+    match RESERVED_BODY_FIELDS.iter().find(|field| fields.contains_key(**field)) {
+        Some(field) => Err(format!("error: --extra-body cannot set `{field}`; jg owns that request field\n")),
+        None => Ok(fields),
+    }
 }
 
 fn probability(value: &str) -> Result<f64, String> {
@@ -266,13 +345,16 @@ fn parse_args_with_env(argv: Vec<OsString>, mut env: impl FnMut(&str) -> Option<
     let backend = match raw.backend {
         Some(backend) => backend,
         None => match env("JG_BACKEND").filter(|v| !v.is_empty()) {
-            Some(value) => BackendKind::from_str(&value, false).map_err(|_| "error: JG_BACKEND must be jev or chatgpt\n".to_owned())?,
+            Some(value) => BackendKind::from_str(&value, false)
+                .map_err(|_| "error: JG_BACKEND must be jev, chatgpt, openrouter or openai\n".to_owned())?,
             None => BackendKind::default(),
         },
     };
-    let (default_model, default_url) = match backend {
-        BackendKind::Jev => (DEFAULT_MODEL, DEFAULT_BASE_URL),
-        BackendKind::Chatgpt => (CHATGPT_MODEL, DEFAULT_CHATGPT_URL),
+    let provider = backend.provider();
+    let (default_model, default_url) = match (backend, provider) {
+        (_, Some(provider)) => (provider.model.unwrap_or_default(), provider.base_url),
+        (BackendKind::Chatgpt, None) => (CHATGPT_MODEL, DEFAULT_CHATGPT_URL),
+        (_, None) => (DEFAULT_MODEL, DEFAULT_BASE_URL),
     };
     let model = raw.model.unwrap_or_else(|| env("JG_MODEL").filter(|v| !v.is_empty()).unwrap_or_else(|| default_model.to_owned()));
     if backend == BackendKind::Chatgpt && model != CHATGPT_MODEL {
@@ -281,7 +363,29 @@ fn parse_args_with_env(argv: Vec<OsString>, mut env: impl FnMut(&str) -> Option<
     if raw.chatgpt_login && backend != BackendKind::Chatgpt {
         return Err("error: --chatgpt-login requires --backend chatgpt\n".to_owned());
     }
-    let base_url = raw.base_url.unwrap_or_else(|| env("JG_BASE_URL").filter(|v| !v.is_empty()).unwrap_or_else(|| default_url.to_owned()));
+    let compatible_only = [
+        ("--api-key", raw.api_key.is_some()),
+        ("--api-key-env", raw.api_key_env.is_some()),
+        ("--json-schema", raw.json_schema),
+        ("--extra-body", raw.extra_body.is_some()),
+    ];
+    if let (None, Some((flag, _))) = (provider, compatible_only.iter().find(|(_, given)| *given)) {
+        return Err(format!("error: {flag} requires an OpenAI-compatible backend: --backend openrouter or openai\n"));
+    }
+    if provider.is_some() && model.trim().is_empty() {
+        return Err("error: --backend openai has no default model; pass --model or set JG_MODEL\n".to_owned());
+    }
+    // The variable is an environment default for these backends only; elsewhere it means nothing.
+    let extra_body = match raw.extra_body.or_else(|| provider.and_then(|_| env("JG_EXTRA_BODY")).filter(|v| !v.is_empty())) {
+        Some(text) => parse_extra_body(&text)?,
+        None => serde_json::Map::new(),
+    };
+    let base_url = raw.base_url.unwrap_or_else(|| {
+        let conventional = |name: &str, env: &mut dyn FnMut(&str) -> Option<String>| env(name).filter(|v| !v.is_empty());
+        conventional("JG_BASE_URL", &mut env)
+            .or_else(|| (backend == BackendKind::Openai).then(|| conventional("OPENAI_BASE_URL", &mut env)).flatten())
+            .unwrap_or_else(|| default_url.to_owned())
+    });
     Ok(Parsed::Run(Box::new(Args {
         queries: std::iter::once(raw.query).chain(raw.extra).map(|q| q.trim().to_owned()).filter(|q| !q.is_empty()).collect(),
         paths: raw.paths,
@@ -310,6 +414,10 @@ fn parse_args_with_env(argv: Vec<OsString>, mut env: impl FnMut(&str) -> Option<
         quiet: raw.quiet,
         backend,
         chatgpt_login: raw.chatgpt_login,
+        api_key: raw.api_key.map(ApiKey),
+        api_key_env: raw.api_key_env,
+        json_schema: raw.json_schema,
+        extra_body,
         model,
         base_url,
         color: raw.color,
@@ -361,7 +469,7 @@ mod tests {
         assert_eq!((a.model.as_str(), a.base_url.as_str()), (DEFAULT_MODEL, DEFAULT_BASE_URL));
         assert_eq!(a.color, ColorMode::Auto);
         assert_eq!(a.backend, BackendKind::Jev);
-        assert!(!a.chatgpt_login);
+        assert!(!a.chatgpt_login && a.api_key.is_none() && a.api_key_env.is_none() && !a.json_schema && a.extra_body.is_empty());
         assert_eq!(ColorMode::default(), ColorMode::Auto);
     }
 
@@ -397,6 +505,10 @@ mod tests {
             ("quiet", Some('q')),
             ("backend", None),
             ("chatgpt-login", None),
+            ("api-key", None),
+            ("api-key-env", None),
+            ("json-schema", None),
+            ("extra-body", None),
             ("model", None),
             ("base-url", None),
             ("color", None),
@@ -714,6 +826,115 @@ mod tests {
     }
 
     #[test]
+    fn openrouter_selection_controls_defaults_and_keeps_the_key_out_of_debug() {
+        let a = run(&["q", "--backend", "openrouter"]);
+        assert_eq!(a.backend, BackendKind::Openrouter);
+        assert_eq!(
+            (a.model.as_str(), a.base_url.as_str(), a.jobs),
+            ("inclusionai/ling-3.0-flash-fin:free", "https://openrouter.ai/api/v1", 32)
+        );
+        assert!(a.api_key.is_none());
+        // Unlike ChatGPT, the model is the user's to choose.
+        let a = run(&["q", "--backend", "openrouter", "--model", "vendor/other", "--api-key", "sk-or-first", "--api-key=sk-or-last"]);
+        assert_eq!(a.model, "vendor/other");
+        assert_eq!(a.api_key, Some(ApiKey("sk-or-last".into())));
+        // The key is kept exactly as given, but never shown by `{:?}`.
+        assert!(!format!("{a:?}").contains("sk-or-last") && format!("{a:?}").contains("<redacted>"));
+        let Parsed::Run(a) = parse_args_with_env(argv(&["q", "--api-key", "k"]), |key| match key {
+            "JG_BACKEND" => Some("openrouter".into()),
+            "JG_MODEL" => Some("vendor/from-env".into()),
+            // Key variables are resolved when the backend is built, not while parsing.
+            "OPENROUTER_API_KEY" | "OPENAI_API_KEY" => panic!("parsing must not read credentials"),
+            // OpenAI's own convention is not OpenRouter's.
+            "OPENAI_BASE_URL" => panic!("only the openai backend reads this"),
+            _ => None,
+        })
+        .unwrap() else {
+            panic!("expected Run")
+        };
+        assert_eq!((a.backend, a.model.as_str()), (BackendKind::Openrouter, "vendor/from-env"));
+        assert!(parse(&["q", "--backend", "openrouter", "--chatgpt-login"]).unwrap_err().contains("--backend chatgpt"));
+        let unknown = parse_args_with_env(argv(&["q"]), |key| (key == "JG_BACKEND").then(|| "unknown".into())).unwrap_err();
+        assert!(unknown.contains("openrouter or openai"), "{unknown}");
+    }
+
+    #[test]
+    fn the_openai_backend_needs_a_model_and_takes_its_root_from_flag_or_environment() {
+        assert_eq!(BackendKind::Openai.provider().map(|p| p.name), Some("OpenAI"));
+        assert!(BackendKind::Jev.provider().is_none() && BackendKind::Chatgpt.provider().is_none());
+        let a = run(&["q", "--backend", "openai", "--model", "m"]);
+        assert_eq!((a.backend, a.model.as_str(), a.base_url.as_str()), (BackendKind::Openai, "m", "https://api.openai.com/v1"));
+        for args in [&["q", "--backend", "openai"][..], &["q", "--backend", "openai", "--model", " "][..]] {
+            assert_eq!(parse(args).unwrap_err(), "error: --backend openai has no default model; pass --model or set JG_MODEL\n");
+        }
+        let with = |flags: &[&str], vars: &'static [(&'static str, &'static str)]| {
+            let words: Vec<&str> = ["q", "--backend", "openai", "--model", "m"].iter().chain(flags).copied().collect();
+            let parsed = parse_args_with_env(argv(&words), |name| vars.iter().find(|(k, _)| *k == name).map(|(_, v)| (*v).to_owned()));
+            let Parsed::Run(a) = parsed.unwrap() else { panic!("expected Run") };
+            a.base_url.clone()
+        };
+        let both = &[("JG_BASE_URL", "https://jg.example/v1"), ("OPENAI_BASE_URL", "https://sdk.example/v1")];
+        assert_eq!(with(&["--base-url", "http://localhost:11434/v1"], both), "http://localhost:11434/v1");
+        assert_eq!(with(&[], both), "https://jg.example/v1");
+        assert_eq!(with(&[], &[("OPENAI_BASE_URL", "https://sdk.example/v1")]), "https://sdk.example/v1");
+        assert_eq!(with(&[], &[("JG_BASE_URL", ""), ("OPENAI_BASE_URL", "")]), "https://api.openai.com/v1");
+    }
+
+    #[test]
+    fn openai_compatible_flags_are_scoped_validated_and_never_echoed() {
+        let a = run(&[
+            "q",
+            "--backend=openai",
+            "--model=m",
+            "--api-key-env",
+            "GROQ_API_KEY",
+            "--json-schema",
+            "--extra-body",
+            r#"{"reasoning_effort":"low","temperature":null}"#,
+        ]);
+        assert_eq!(a.api_key_env.as_deref(), Some("GROQ_API_KEY"));
+        assert!(a.json_schema && a.api_key.is_none());
+        assert_eq!(serde_json::Value::Object(a.extra_body.clone()), serde_json::json!({"reasoning_effort": "low", "temperature": null}));
+
+        let from_env = |backend: &'static str| {
+            let parsed = parse_args_with_env(argv(&["q", "--backend", backend, "--model", "jev-latest"]), |name| {
+                (name == "JG_EXTRA_BODY").then(|| r#"{"seed":7}"#.into())
+            });
+            let Parsed::Run(a) = parsed.unwrap() else { panic!("expected Run") };
+            a.extra_body.clone()
+        };
+        assert_eq!(from_env("openrouter")["seed"], 7);
+        assert!(from_env("jev").is_empty(), "the variable is a default for compatible backends, not an error elsewhere");
+        let flag_wins = parse_args_with_env(argv(&["q", "--backend=openrouter", "--extra-body={}"]), |name| {
+            (name == "JG_EXTRA_BODY").then(|| "broken".into())
+        });
+        assert!(matches!(flag_wins, Ok(Parsed::Run(a)) if a.extra_body.is_empty()));
+
+        for (flags, flag) in [
+            (&["--api-key", "k"][..], "--api-key"),
+            (&["--api-key-env", "V"][..], "--api-key-env"),
+            (&["--json-schema"][..], "--json-schema"),
+            (&["--extra-body", "{}"][..], "--extra-body"),
+        ] {
+            for backend in [&[][..], &["--backend", "jev"][..], &["--backend=chatgpt"][..]] {
+                let words: Vec<&str> = ["q"].iter().chain(backend).chain(flags).copied().collect();
+                let error = parse(&words).unwrap_err();
+                assert_eq!(error, format!("error: {flag} requires an OpenAI-compatible backend: --backend openrouter or openai\n"));
+            }
+        }
+        assert!(parse(&["q", "--backend=openrouter", "--api-key", "k", "--api-key-env", "V"]).unwrap_err().contains("cannot be used with"));
+        for bad in ["", "[]", "7", "{broken", r#""text""#] {
+            let error = parse(&["q", "--backend=openrouter", "--extra-body", bad]).unwrap_err();
+            assert!(error.contains("must be a JSON object"), "{bad}: {error}");
+        }
+        for reserved in ["messages", "stream"] {
+            let secret = format!(r#"{{"{reserved}":"sk-secret-routing-token"}}"#);
+            let error = parse(&["q", "--backend=openrouter", "--extra-body", &secret]).unwrap_err();
+            assert!(error.contains(reserved) && !error.contains("sk-secret"), "{error}");
+        }
+    }
+
+    #[test]
     fn help_version_and_errors_never_read_application_environment() {
         for args in [vec!["-h"], vec!["--help"], vec!["-V"], vec!["--version"], vec![], vec!["q", "--jobs=0"], vec!["q", "--bogus"]] {
             let _ = parse_args_with_env(argv(&args), |_| panic!("early exits must not resolve environment"));
@@ -748,9 +969,19 @@ mod tests {
                 }
             }
         }
-        for text in
-            [DEFAULT_MODEL, DEFAULT_BASE_URL, "TYPESAFE_API_KEY", "JG_MODEL", "JG_BASE_URL", "0 matches found, 1 none, 2 error", "weaker"]
-        {
+        for text in [
+            DEFAULT_MODEL,
+            DEFAULT_BASE_URL,
+            "inclusionai/ling-3.0-flash-fin:free",
+            "OPENAI_API_KEY",
+            "--api-key-env",
+            "TYPESAFE_API_KEY",
+            "OPENROUTER_API_KEY",
+            "JG_MODEL",
+            "JG_BASE_URL",
+            "0 matches found, 1 none, 2 error",
+            "weaker",
+        ] {
             assert!(unwrapped.contains(text), "missing {text}");
         }
         assert!(!short.contains('\u{1b}'));

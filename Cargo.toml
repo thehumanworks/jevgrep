@@ -3,7 +3,7 @@ name = "jevgrep"
 version = "0.2.0"
 edition = "2021"
 rust-version = "1.98.1"
-description = "jg: natural-language code search with Jev and ChatGPT decision backends"
+description = "jg: natural-language code search with Jev, ChatGPT and OpenAI-compatible decision backends"
 readme = "README.md"
 
 [[bin]]
