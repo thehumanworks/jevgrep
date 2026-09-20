@@ -38,7 +38,9 @@ again. Changes that do not alter the binary (docs, tests, CI, this file) need no
 
 - `scripts/check.sh` is the quality gate CI runs. Where its pinned tools are not installed, run
   its steps by hand: `cargo test`, `cargo clippy --all-targets -- -D warnings`,
-  `cargo fmt --check`.
+  `cargo fmt --check`. Clippy levels live in `Cargo.toml` (ADR 0006).
+- `scripts/pre-commit.sh` is the fast local commit gate (fmt, Clippy, tests). Install with
+  `scripts/install-git-hooks.sh`. It must keep the same Clippy invocation as `check.sh`.
 - `tests/fixtures/help.txt` is the exact `jg --help` output. After changing help text or flags,
   regenerate it with `cargo build --release && target/release/jg --help > tests/fixtures/help.txt`
   and read the diff.

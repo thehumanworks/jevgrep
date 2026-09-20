@@ -511,5 +511,52 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn('[[ ${actual%% *} == "$expected" ]]', installer)
 
 
+class CorrectnessGateTests(unittest.TestCase):
+    CLIPPY = 'cargo +"$pin" clippy --locked --all-targets --all-features -- -D warnings'
+
+    def test_clippy_policy_is_correctness_first(self):
+        cargo = (ROOT / "Cargo.toml").read_text()
+        self.assertIn('unsafe_code = "forbid"', cargo)
+        self.assertIn('correctness = "deny"', cargo)
+        self.assertIn('suspicious = "deny"', cargo)
+        self.assertIn('string_slice = "deny"', cargo)
+        self.assertIn('lossy_float_literal = "deny"', cargo)
+        self.assertNotIn('pedantic = "deny"', cargo)
+        self.assertNotIn('restriction = "deny"', cargo)
+        self.assertNotIn('nursery = "deny"', cargo)
+
+    def test_check_and_precommit_use_the_same_clippy_invocation(self):
+        check = (ROOT / "scripts/check.sh").read_text()
+        hook = (ROOT / "scripts/pre-commit.sh").read_text()
+        self.assertIn(self.CLIPPY, check)
+        self.assertIn(self.CLIPPY, hook)
+        self.assertIn("scripts/githooks/*", check)
+        self.assertIn("cargo +\"$pin\" fmt --all -- --check", hook)
+        self.assertIn(
+            'cargo +"$pin" test --locked --all-targets --all-features', hook
+        )
+        self.assertIn("scripts/check.sh", hook)
+
+    def test_precommit_is_installable_and_avoids_secret_tools(self):
+        hook = (ROOT / "scripts/pre-commit.sh").read_text()
+        installer = (ROOT / "scripts/install-git-hooks.sh").read_text()
+        wrapper = (ROOT / "scripts/githooks/pre-commit").read_text()
+        self.assertIn("core.hooksPath", installer)
+        self.assertIn("scripts/githooks", installer)
+        self.assertIn("scripts/pre-commit.sh", wrapper)
+        for text in (hook, installer, wrapper):
+            for banned in ("fnox", "1Password", "op run", ".claude", "agent-store"):
+                self.assertNotIn(banned, text)
+        readme = (ROOT / "README.md").read_text()
+        self.assertIn("scripts/install-git-hooks.sh", readme)
+        self.assertIn("scripts/pre-commit.sh", readme)
+        for adr in (
+            "0006-clippy-correctness.md",
+            "0007-tests-as-specification.md",
+            "0008-pre-commit-hook.md",
+        ):
+            self.assertTrue((ROOT / "docs/adr" / adr).is_file(), adr)
+
+
 if __name__ == "__main__":
     unittest.main()

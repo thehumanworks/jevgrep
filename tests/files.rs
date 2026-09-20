@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-use jevgrep::files::{chunk_lines, discover, fnmatch, read_lines, split_blocks, split_chunk, Chunk, Chunking, Discover};
+use jevgrep::files::{chunk_lines, discover, fnmatch, is_definition, read_lines, split_blocks, split_chunk, Chunk, Chunking, Discover};
 
 fn lines_of(c: &Chunk) -> Vec<usize> {
     c.blocks.iter().flat_map(|&(a, b)| a..=b).collect()
@@ -120,6 +120,184 @@ fn fnmatch_follows_shell_rules_with_star_crossing_slashes() {
     assert!(fnmatch("a1.rs", "a[0-9].rs") && !fnmatch("ax.rs", "a[0-9].rs") && fnmatch("ax.rs", "a[!0-9].rs"));
     assert!(!fnmatch("b.pyc", "*.py") && !fnmatch("B.py", "b.py") && fnmatch("", "*") && !fnmatch("", "?"));
     assert!(fnmatch("a[b", "a[b") && fnmatch("docs/x/readme.md", "docs/*") && fnmatch("abcbc", "a*bc"));
+}
+
+#[test]
+fn fnmatch_character_classes_and_literals_are_table_driven() {
+    let cases: &[(&str, &str, bool)] = &[
+        ("", "", true),
+        ("", "*", true),
+        ("", "?", false),
+        ("a", "", false),
+        ("a", "a", true),
+        ("a", "b", false),
+        ("é", "?", true),
+        ("🙂", "?", true),
+        ("ab", "?", false),
+        ("αβ", "??", true),
+        ("src/a/b.py", "src/*/b.py", true),
+        ("src/a/b.py", "src/*/*.py", true),
+        ("a/b/c", "a/*", true),
+        ("abc", "a*c", true),
+        ("ac", "a*c", true),
+        ("abbc", "a*bc", true),
+        ("file.rs", "*.rs", true),
+        ("file.rs.bak", "*.rs", false),
+        ("a", "[abc]", true),
+        ("d", "[abc]", false),
+        ("b", "[a-c]", true),
+        ("d", "[a-c]", false),
+        ("0", "[!a-z]", true),
+        ("q", "[!a-z]", false),
+        ("3", "[^0-9]", false),
+        ("x", "[^0-9]", true),
+        ("]", "[]]", true),
+        ("a", "[]]", false),
+        ("a", "[[]", false),
+        ("[", "[[]", true),
+        ("Z", "[A-Z]", true),
+        ("z", "[A-Z]", false),
+        ("foo", "foo*", true),
+        ("foobar", "foo*", true),
+        ("barfoo", "foo*", false),
+        ("ab", "a**b", true),
+        ("axb", "a?b", true),
+        ("ab", "a?b", false),
+    ];
+    for &(text, pattern, want) in cases {
+        assert_eq!(fnmatch(text, pattern), want, "fnmatch({text:?}, {pattern:?})");
+    }
+}
+
+/// A star-and-question pattern without classes is prefix/suffix/single-char matching.
+fn star_question_oracle(text: &str, pattern: &str) -> bool {
+    let (t, p): (Vec<char>, Vec<char>) = (text.chars().collect(), pattern.chars().collect());
+    fn rec(t: &[char], p: &[char]) -> bool {
+        match (t, p) {
+            ([], p) => p.iter().all(|&c| c == '*'),
+            (t, ['*', rest @ ..]) => rec(t, rest) || rec(&t[1..], p),
+            ([_, t_rest @ ..], ['?', p_rest @ ..]) => rec(t_rest, p_rest),
+            ([tc, t_rest @ ..], [pc, p_rest @ ..]) if tc == pc => rec(t_rest, p_rest),
+            _ => false,
+        }
+    }
+    rec(&t, &p)
+}
+
+#[test]
+fn fnmatch_agrees_with_a_star_question_oracle() {
+    let mut rng = 19u64;
+    let step = |rng: &mut u64| {
+        *rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (*rng >> 33) as usize
+    };
+    let alphabet = ['a', 'b', 'c', '/', '.', 'é'];
+    for _ in 0..300 {
+        let text: String = (0..step(&mut rng) % 8).map(|_| alphabet[step(&mut rng) % alphabet.len()]).collect();
+        let pattern: String = (0..step(&mut rng) % 8)
+            .map(|_| match step(&mut rng) % 6 {
+                0 => '*',
+                1 => '?',
+                n => alphabet[n % alphabet.len()],
+            })
+            .collect();
+        assert_eq!(fnmatch(&text, &pattern), star_question_oracle(&text, &pattern), "{text:?} {pattern:?}");
+    }
+    assert!(fnmatch("anything", "*"));
+    assert!(fnmatch("exact", "exact"));
+    assert!(!fnmatch("exact", "other"));
+}
+
+#[test]
+fn is_definition_recognizes_common_openers_and_rejects_lookalikes() {
+    let cases: &[(&str, bool)] = &[
+        ("def foo():", true),
+        ("    def foo():", true),
+        ("async def foo():", true),
+        ("class Greeter:", true),
+        ("pub fn foo() {", true),
+        ("pub(crate) async fn run() {", true),
+        ("export default function App() {", true),
+        ("struct Walk {", true),
+        ("impl Foo {", true),
+        ("enum Kind {", true),
+        ("trait Bar {", true),
+        ("type Alias = u8;", true),
+        ("mod inner {", true),
+        ("macro_rules! m {", true),
+        ("x = 1", false),
+        ("define", false),
+        ("default = 1", false),
+        ("# def foo", false),
+        ("// fn foo", false),
+        ("fnord = 1", false),
+        ("classic = 1", false),
+    ];
+    for &(line, want) in cases {
+        assert_eq!(is_definition(line), want, "{line:?}");
+    }
+}
+
+#[test]
+fn clip_respects_character_boundaries_and_the_documented_budget() {
+    use jevgrep::files::{clip, MAX_LINE_CHARS};
+    assert_eq!(clip("short"), "short");
+    assert_eq!(clip("short  \t"), "short");
+    let ascii = "a".repeat(MAX_LINE_CHARS + 20);
+    let clipped = clip(&ascii);
+    assert!(clipped.ends_with(" ..."));
+    assert_eq!(clipped.chars().count(), MAX_LINE_CHARS + 4);
+    let wide = "界".repeat(MAX_LINE_CHARS + 8);
+    let clipped = clip(&wide);
+    assert_eq!(clipped.chars().count(), MAX_LINE_CHARS + 4);
+    assert!(clipped.starts_with(&"界".repeat(MAX_LINE_CHARS)));
+    let mixed = format!("{}🙂{}", "e\u{301}".repeat(10), "x".repeat(MAX_LINE_CHARS));
+    let clipped = clip(&mixed);
+    assert!(clipped.is_char_boundary(clipped.len().saturating_sub(4)) || clipped.ends_with(" ..."));
+    assert!(clipped.chars().count() <= MAX_LINE_CHARS + 4);
+}
+
+#[test]
+fn chunk_and_block_invariants_hold_for_arbitrary_files() {
+    let mut rng = 23u64;
+    let step = |rng: &mut u64| {
+        *rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (*rng >> 33) as usize
+    };
+    for _ in 0..80 {
+        let n = 1 + step(&mut rng) % 80;
+        let lines: Vec<String> = (0..n)
+            .map(|i| match step(&mut rng) % 5 {
+                0 => String::new(),
+                1 => format!("def f{i}():"),
+                2 => format!("    x{i} = {i}"),
+                3 => "    # comment".into(),
+                _ => format!("value_{i}"),
+            })
+            .collect();
+        let blocks = split_blocks(&lines);
+        assert!(blocks.windows(2).all(|w| w[0].1 < w[1].0), "blocks must be disjoint and ordered");
+        for &(a, b) in &blocks {
+            assert!(1 <= a && a <= b && b <= n);
+            assert!(!lines[b - 1].trim().is_empty() || a == b);
+        }
+        let covered: Vec<usize> = blocks.iter().flat_map(|&(a, b)| a..=b).collect();
+        assert!(lines.iter().enumerate().all(|(i, line)| line.trim().is_empty() || covered.contains(&(i + 1))));
+        let cfg = Chunking { max_lines: 8 + step(&mut rng) % 40, context: step(&mut rng) % 6, ..Chunking::default() };
+        let chunks = chunk_lines("f.py", &lines, cfg);
+        let asked: Vec<usize> = chunks.iter().flat_map(|c| c.start..=c.end).collect();
+        if lines.iter().any(|l| !l.trim().is_empty()) {
+            assert!(!chunks.is_empty());
+            assert!(asked.windows(2).all(|w| w[0] < w[1]), "chunk ranges cover each line at most once");
+        }
+        for c in &chunks {
+            assert!(c.ctx_start <= c.start && c.start <= c.end);
+            assert!(c.askable().iter().all(|&n| c.start <= n && n <= c.end));
+            assert!(c.askable().iter().all(|&n| c.text(n).bytes().any(|b| b.is_ascii_alphanumeric())));
+            assert!(c.end - c.start < cfg.max_lines.max(1));
+            assert_eq!(c.lines.len(), c.end - c.ctx_start + 1);
+        }
+    }
 }
 
 fn scratch(name: &str) -> std::path::PathBuf {

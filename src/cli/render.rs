@@ -66,8 +66,17 @@ fn file_lines(path: &str) -> Vec<String> {
     std::fs::read(path).map(|d| String::from_utf8_lossy(&d).lines().map(str::to_owned).collect()).unwrap_or_default()
 }
 
+fn ellipsis(width: usize) -> &'static str {
+    match width.min(3) {
+        0 => "",
+        1 => ".",
+        2 => "..",
+        _ => "...",
+    }
+}
+
 fn cut(text: &str, width: usize) -> String {
-    console::truncate_str(text, width, &"..."[..width.min(3)]).into_owned()
+    console::truncate_str(text, width, ellipsis(width)).into_owned()
 }
 
 fn r4(x: f64) -> f64 {
@@ -400,7 +409,7 @@ mod tests {
             for width in [0, 1, 2, 3, 4, 7, 110, 200] {
                 let truncated = cut(&long, width);
                 assert!(console::measure_text_width(&truncated) <= width, "{sample:?} width={width}: {truncated:?}");
-                assert!(truncated.ends_with(&"..."[..width.min(3)]));
+                assert!(truncated.ends_with(ellipsis(width)));
             }
         }
         assert_eq!(cut("界界界", 5), "界...");

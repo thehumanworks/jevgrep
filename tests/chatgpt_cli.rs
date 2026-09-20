@@ -205,10 +205,12 @@ fn success_sse(body: &Value, empty_completed_output: bool) -> HttpReply {
         status: 200,
         content_type: "text/event-stream",
         body: {
+            let head = payload.get(..mid).unwrap_or(payload.as_str());
+            let tail = payload.get(mid..).unwrap_or("");
             let mut bytes = sse_events(&[
                 ("response.created", json!({"type": "response.created"})),
-                ("response.output_text.delta", json!({"type": "response.output_text.delta", "delta": &payload[..mid]})),
-                ("response.output_text.delta", json!({"type": "response.output_text.delta", "delta": &payload[mid..]})),
+                ("response.output_text.delta", json!({"type": "response.output_text.delta", "delta": head})),
+                ("response.output_text.delta", json!({"type": "response.output_text.delta", "delta": tail})),
                 ("response.output_text.done", json!({"type": "response.output_text.done", "text": payload})),
                 (
                     "response.output_item.done",

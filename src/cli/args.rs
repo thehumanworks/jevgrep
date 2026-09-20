@@ -436,6 +436,21 @@ mod tests {
     }
 
     #[test]
+    fn generated_help_names_every_long_option() {
+        let help = printed(&["--help"]);
+        let mut command = CommandLine::command();
+        command.build();
+        for arg in command.get_arguments() {
+            if let Some(long) = arg.get_long() {
+                assert!(help.contains(&format!("--{long}")), "help is missing --{long}");
+            }
+        }
+        assert!(help.contains("QUERY"), "{help}");
+        assert!(help.contains("environment:"), "{help}");
+        assert!(!help.contains('\u{1b}'));
+    }
+
+    #[test]
     fn every_default_matches_the_baseline() {
         let a = run(&["q"]);
         assert_eq!(a.queries, ["q"]);

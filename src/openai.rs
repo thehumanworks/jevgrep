@@ -163,9 +163,10 @@ pub fn resolve_key(base_url: &str, flag: Option<&str>, env: impl Fn(&str) -> Opt
 fn reply_object_in(text: &str) -> Option<Value> {
     let text = text.rsplit("</think>").next().unwrap_or(text);
     let (mut found, mut from) = (None, 0);
-    while let Some(offset) = text[from..].find('{') {
+    while let Some(offset) = text.get(from..).and_then(|rest| rest.find('{')) {
         let start = from + offset;
-        let mut stream = serde_json::Deserializer::from_str(&text[start..]).into_iter::<Value>();
+        let Some(tail) = text.get(start..) else { break };
+        let mut stream = serde_json::Deserializer::from_str(tail).into_iter::<Value>();
         match stream.next() {
             Some(Ok(value)) => {
                 from = start + stream.byte_offset();
@@ -514,7 +515,7 @@ impl OpenAiClient {
         let flat: String = scrubbed.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
         let flat = flat.trim();
         match flat.char_indices().nth(MAX_ERROR_CHARS) {
-            Some((cut, _)) => format!("{}...", &flat[..cut]),
+            Some((cut, _)) => format!("{}...", flat.get(..cut).unwrap_or(flat)),
             None => flat.to_owned(),
         }
     }
