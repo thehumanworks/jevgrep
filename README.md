@@ -1,31 +1,13 @@
 # jevgrep (`jg`)
 
-Natural-language grep. Ask a question about a codebase in plain language and get back the files
-and line numbers that answer it.
+Natural-language grep. Ask a question about a codebase in plain language and get
+back the files and line numbers that answer it.
 
-`jg` is built on a reusable decision backend: it sends a JSON `state` plus named typed questions
-and receives a Jev-compatible `answers` map (`noul` / `score`). Search, filters and rendering
-are independent of the provider. The default backend is [Jev](https://typesafe.ai/blog/introducing-system-one-models-and-jev),
-TypeSafe's decision model. Jev does not generate text. It returns calibrated probabilities and
-evaluates every question in a request in parallel. `jg` exploits that: each file chunk becomes
-one request carrying one question per line, and all requests fan out over a thread pool.
-A 9,000-line codebase is scored line by line in about 2 seconds for about 1 cent.
-
-`--backend chatgpt` (or `JG_BACKEND=chatgpt`) uses your ChatGPT subscription instead, posting
-directly to `https://chatgpt.com/backend-api/codex/responses` with fixed model `gpt-5.6-luna`.
-That path is not Codex inference. ChatGPT scores use the same grep JSON/text schema as Jev, but
-they are generative relevance estimates, not empirically calibrated probabilities.
-
-`--backend openai` sends the same questions to any OpenAI-compatible service, configured the way
-OpenAI's own SDKs are: `OPENAI_API_KEY` and `OPENAI_BASE_URL`. api.openai.com is the default, and
-[OpenRouter](https://openrouter.ai), Groq, a corporate gateway, vLLM, llama.cpp, Ollama or LM
-Studio are each just a base URL, a key (or none) and a model. `jg` prefers the Responses API with
-structured outputs and falls back by itself where a service lacks them. These scores are model
-estimates too.
-
-`jg` is a single native binary written in Rust, with no runtime to install. The Linux GNU
-host release build with all backends is about 3.3 MB (3,334,600 bytes).
-Its only dynamic dependencies are libc and libgcc, and TLS roots are compiled in.
+`jg` is a single Rust binary. The default backend is
+[Jev](https://typesafe.ai/blog/introducing-system-one-models-and-jev), TypeSafe's
+decision model: calibrated probabilities, every question in a request evaluated
+in parallel. You can instead use a ChatGPT subscription (`--backend chatgpt`) or
+any OpenAI-compatible service (`--backend openai`).
 
 ```console
 $ jg "which HTTP method is used after a 303 redirect"
@@ -37,10 +19,155 @@ httpx/_client.py  relevance=1.00
 jg: 23 files, 72 requests, 301,208 tokens (~$0.0127), 2.2s
 ```
 
-Jev stats include a token dollar estimate. ChatGPT subscription stats do not: they report
-input and output tokens, that priority was requested, and the tier the server actually served.
-`openai` stats report input and output tokens, the service's host and the model, and a cost only
-where the service itself states one, as OpenRouter does (`$0.0000` on a free model).
+Jev stats include a token dollar estimate; the other backends report tokens (and a cost only
+when the service states one).
+
+## Install
+
+Every [release](https://github.com/thehumanworks/jevgrep/releases) carries a prebuilt binary for
+macOS on Apple Silicon (`aarch64-apple-darwin`) and Linux on x64 and aarch64
+(`x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`). The Linux builds are static, so they
+run on any distribution regardless of its glibc. The Linux GNU host build is about 3.3 MB; its
+only dynamic dependencies are libc and libgcc, and TLS roots are compiled in.
+
+With [mise](https://mise.jdx.dev), pointed straight at this repo:
+
+```bash
+mise exec github:thehumanworks/jevgrep -- jg --help   # one-off run, nothing installed
+mise use -g github:thehumanworks/jevgrep              # or put `jg` on PATH for good
+```
+
+Or download a tarball from the releases page and drop the binary on your PATH
+(replace `v0.3.0` with the version on the
+[releases](https://github.com/thehumanworks/jevgrep/releases) page):
+
+```bash
+tar xzf jevgrep-v0.3.0-x86_64-unknown-linux-musl.tar.gz
+install -m755 jevgrep-v0.3.0-x86_64-unknown-linux-musl/jg ~/.local/bin/jg
+```
+
+From source:
+
+```bash
+cargo install --path .      # builds the release binary and puts `jg` in ~/.cargo/bin
+# or build it and copy it wherever you like:
+cargo build --release && install -m755 target/release/jg ~/.local/bin/jg
+```
+
+A source build links against the system libc, so the binary can be copied to any
+machine with the same OS, architecture, and a libc at least as new. Windows is
+not built or tested. Static Linux builds come from adding the musl target and a musl
+C compiler, then `cargo build --release --target x86_64-unknown-linux-musl`.
+
+`jg` is not useful until a backend is configured. See **Set up a backend**.
+
+## Set up a backend
+
+Pick one. The default is Jev.
+
+### Jev (default)
+
+Create a TypeSafe API key
+([quick start](https://docs.typesafe.ai/introduction/quickstart)) and export it:
+
+```bash
+export TYPESAFE_API_KEY=...   # required for --backend jev (the default)
+jg "where is the timeout set"
+```
+
+The repo and the release binaries do not include a key. `jg` reads
+`TYPESAFE_API_KEY` from the environment. Keep the key out of git and out of
+process listings (`ps` can see a flag; prefer the variable).
+
+### ChatGPT (`--backend chatgpt`)
+
+Uses your ChatGPT subscription, posting to
+`https://chatgpt.com/backend-api/codex/responses` with fixed model `gpt-5.6-luna`.
+That path is not Codex inference. Scores use the same output schema as Jev, but
+they are generative estimates, not calibrated probabilities.
+
+The ChatGPT backend needs a subscription pair, resolved in this order and never
+mixed across sources:
+
+1. Complete `CHATGPT_ACCOUNT_ID` and `CHATGPT_ACCESS_TOKEN` together.
+2. Optional `$XDG_CONFIG_HOME/auth.toml` (must be an absolute XDG path) or `~/.config/auth.toml`.
+   TOML may use those uppercase keys, lowercase `account_id` / `access_token`, or the same
+   lowercase pair under `[chatgpt]` or `[tokens]`.
+3. `$CODEX_HOME/auth.json` or `~/.codex/auth.json` (`tokens.account_id` / `tokens.access_token`).
+
+A partial or invalid selected pair is an error. Normal searches never start an
+interactive login. `--chatgpt-login` is explicit: device login, then the search.
+A stale cache fails at the server with a `--chatgpt-login` hint.
+
+### OpenAI-compatible (`--backend openai`)
+
+Same shape as OpenAI's SDKs. `--model` or `$JG_MODEL` is required (no default).
+api.openai.com is the default; [OpenRouter](https://openrouter.ai), Groq, a corporate
+gateway, vLLM, llama.cpp, Ollama or LM Studio are each a base URL, a key (or none)
+and a model. `jg` prefers the Responses API with structured outputs and falls back
+where a service lacks them. These scores are model estimates too.
+
+```bash
+export OPENAI_API_KEY=...                            # or --api-key; omit for local servers
+export OPENAI_BASE_URL=https://openrouter.ai/api/v1  # default https://api.openai.com/v1
+jg --backend openai --model VENDOR/MODEL "<query>"
+
+jg --backend openai --base-url http://localhost:11434/v1 --model MODEL -j 2 "<query>"
+```
+
+Prefer `OPENAI_API_KEY` over `--api-key` (`ps` can see the flag). The key is sent
+to whatever base URL you set. api.openai.com requires one; other hosts may not.
+A key is only sent over HTTPS, or HTTP on localhost.
+
+[Vercel AI Gateway](https://vercel.com/docs/ai-gateway) also lists Jev itself, as
+`typesafe-ai/jev`, but [not behind its OpenAI-compatible routes](https://vercel.com/docs/ai-gateway/modalities/evaluation).
+With that base URL and model, `jg` asks Jev on the gateway's
+[TypeSafe-compatible route](https://vercel.com/docs/ai-gateway/sdks-and-apis/typesafe) with the
+same key, so the scores are Jev's own calibrated ones, billed through the gateway:
+
+```bash
+export OPENAI_API_KEY=$AI_GATEWAY_API_KEY OPENAI_BASE_URL=https://ai-gateway.vercel.sh/v1
+jg --backend openai --model typesafe-ai/jev "<query>"
+```
+
+## Usage
+
+```
+jg QUERY [PATH ...]
+```
+
+| Flag | Meaning |
+|---|---|
+| `-e QUERY` | extra query answered in the same pass (repeatable); files are read and sent once |
+| `-f, --filter TEXT` | plain-language include/exclude rules, see **Filters in plain language** |
+| `--only CAT`, `--not CAT` | one category each, no parsing; repeatable |
+| `-l, --files` | rank files only, no region or line scoring; about 3x cheaper |
+| `-b, --broad` | flag every line related to the query, not only the lines that answer it |
+| `-t 0.5` | minimum probability for a region or line to match; raise for precision, lower for recall |
+| `-T 0.6` | file relevance needed for `-l`, or for the weaker tier |
+| `-n 15`, `--max-regions 5`, `-m 10` | max files per query, regions per file, pinpointed lines per file |
+| `-C N` | context lines around each pinpointed line |
+| `-g GLOB`, `-x GLOB` | include or exclude files |
+| `--json` | one object per file: `relevance`, `match` (`strong` or `weak`), `regions[]` each with `start`, `end`, `p`, `label`, `label_line`, `lines[]`, plus top-level `lines[]` for lines outside any shown region |
+| `--no-heading` | flat rows: `path:START-END:prob:label` for regions, `path:LINE:prob:text` for lines; matches only |
+| `--triage` | pre-filter files by path first; automatic above `--max-files` (1500) |
+| `-j N` | concurrent requests (must be positive; default 32). On ChatGPT a search with fewer chunks than lanes is cut into smaller requests to fill them |
+| `--backend jev\|chatgpt\|openai` | decision backend; default `jev`, or `$JG_BACKEND`. `openai` is any OpenAI-compatible service |
+| `--chatgpt-login` | ChatGPT only: run Codex device login, then search; requires a query |
+| `--api-key KEY` | `openai` only: API key; default `$OPENAI_API_KEY` |
+| `--no-schema` | `openai` only: do not ask for structured outputs. `jg` finds this out by itself at the cost of one refused request per concurrent first request; the flag saves those for a model known to lack them |
+| `--extra-body JSON` | `openai` only: request fields to add or override, or `$JG_EXTRA_BODY`; `null` removes a field; `input`, `messages` and `stream` are refused |
+| `--model MODEL` | model, or `$JG_MODEL`. Jev: `jev-latest`. `openai`: required, no default. ChatGPT is `gpt-5.6-luna` only; any other `--model` or `$JG_MODEL` is an error unless `--model gpt-5.6-luna` overrides |
+| `--base-url URL` | override the selected backend endpoint, or `$JG_BASE_URL`; `openai` then honours `$OPENAI_BASE_URL`. For `openai` it is an API root (`https://host/v1`), or a full `/responses` or `/chat/completions` URL to settle which API is spoken. ChatGPT and keyed `openai` requests accept HTTPS, or HTTP on `localhost` / `127.0.0.1` / `::1`, and do not follow redirects |
+| `--color auto\|always\|never` | styling for human output; default `auto` |
+
+Exit status follows grep: `0` matches, `1` none, `2` error. Results go to stdout; progress and the
+stats line go to stderr (`-q` silences them). File discovery honors `.gitignore` and skips
+binaries, lockfiles, and files over 512 KB. Invalid arguments exit 2 before discovery, key
+resolution, or API calls. Key and ChatGPT credential resolution run after a successful parse.
+
+`jg --help` is the full flag and environment list. Color, progress, and
+flag/environment precedence are documented there.
 
 ## Reading the output
 
@@ -136,160 +263,6 @@ kinds shown without a filter, 0 remained with it. Excluding tests or benchmarks 
 allowed code lines; excluding "documentation" kept 73 to 88% on the Rust crate, for the reason
 above.
 
-## Install
-
-Every [release](https://github.com/thehumanworks/jevgrep/releases) carries a prebuilt binary for
-macOS on Apple Silicon (`aarch64-apple-darwin`) and Linux on x64 and aarch64
-(`x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`). The Linux builds are static, so they
-run on any distribution regardless of its glibc.
-
-With [mise](https://mise.jdx.dev), pointed straight at this repo:
-
-```bash
-mise exec github:thehumanworks/jevgrep -- jg --help   # one-off run, nothing installed
-mise use -g github:thehumanworks/jevgrep              # or put `jg` on PATH for good
-```
-
-Or download a tarball from the releases page and drop the binary on your PATH:
-
-```bash
-tar xzf jevgrep-v0.2.0-x86_64-unknown-linux-musl.tar.gz
-install -m755 jevgrep-v0.2.0-x86_64-unknown-linux-musl/jg ~/.local/bin/jg
-```
-
-From source:
-
-```bash
-cargo install --path .      # builds the release binary and puts `jg` in ~/.cargo/bin
-# or build it and copy it wherever you like:
-cargo build --release && install -m755 target/release/jg ~/.local/bin/jg
-```
-
-A source build links against the system libc, so the binary can be copied to any machine with the
-same OS, architecture and a libc at least as new. The static builds come from adding the musl
-target (`rustup target add x86_64-unknown-linux-musl`, plus a musl C compiler for the TLS library)
-and building with `--target x86_64-unknown-linux-musl`; `.github/workflows/release.yml` does
-exactly that on every `v*` tag. Windows is not built or tested.
-
-`jg` needs `TYPESAFE_API_KEY` for the default Jev backend. It reads the environment variable first, then falls back to
-`fnox get TYPESAFE_API_KEY`. This repo's `fnox.toml` already provides it, so inside this repo
-`jg` just works. To use `jg` in other repos, export the variable or add the secret to your global
-fnox config.
-
-The ChatGPT backend does not use that key. It needs a ChatGPT subscription pair, resolved in this
-order and never mixed across sources:
-
-1. Complete `CHATGPT_ACCOUNT_ID` and `CHATGPT_ACCESS_TOKEN` together.
-2. Optional `$XDG_CONFIG_HOME/auth.toml` (must be an absolute XDG path) or `~/.config/auth.toml`.
-   TOML may use those uppercase keys, lowercase `account_id` / `access_token`, or the same
-   lowercase pair under `[chatgpt]` or `[tokens]`.
-3. `$CODEX_HOME/auth.json` or `~/.codex/auth.json` (`tokens.account_id` / `tokens.access_token`).
-
-A partial or invalid selected pair is an error. Normal searches never start an interactive login.
-`--chatgpt-login` is explicit: it runs `codex login --device-auth` with file-backed storage,
-sends Codex's stdout to stderr, then reads the new cache (stale env/TOML cannot hide a fresh
-login) and continues the search. A stale Codex cache fails at the server with an actionable
-`--chatgpt-login` hint. Live protocol notes and QA evidence live in
-[docs/chatgpt-verification.md](docs/chatgpt-verification.md).
-
-The `openai` backend is configured like an OpenAI SDK:
-
-```bash
-export OPENAI_API_KEY=...                                   # or --api-key KEY
-export OPENAI_BASE_URL=https://openrouter.ai/api/v1         # or --base-url; default https://api.openai.com/v1
-jg --backend openai --model VENDOR/MODEL "<query>"          # --model or $JG_MODEL is required
-
-jg --backend openai --base-url http://localhost:11434/v1 --model MODEL -j 2 "<query>"   # local, keyless
-fnox run -- sh -c 'OPENAI_API_KEY=$OPENROUTER_API_KEY jg --backend openai --model MODEL "<query>"'
-```
-
-The key is `--api-key`, else `OPENAI_API_KEY`, and nothing else: `jg` never runs `fnox` or any
-other secret manager for it, though you can wrap the call in one as above. Prefer the variable: a
-key passed as `--api-key` is visible to other users in `ps`. As with OpenAI's SDKs, the key is sent
-to whatever base URL is configured. api.openai.com requires one; any other base URL may go without,
-as local servers do. A key is only ever sent over HTTPS, or HTTP on localhost. There is no default
-model: names differ between services and go stale.
-
-[Vercel AI Gateway](https://vercel.com/docs/ai-gateway) also lists Jev itself, as
-`typesafe-ai/jev`, but [not behind its OpenAI-compatible routes](https://vercel.com/docs/ai-gateway/modalities/evaluation).
-With that base URL and model, `jg` asks Jev on the gateway's
-[TypeSafe-compatible route](https://vercel.com/docs/ai-gateway/sdks-and-apis/typesafe) with the
-same key, so the scores are Jev's own calibrated ones, billed through the gateway:
-
-```bash
-export OPENAI_API_KEY=$AI_GATEWAY_API_KEY OPENAI_BASE_URL=https://ai-gateway.vercel.sh/v1
-jg --backend openai --model typesafe-ai/jev "<query>"
-```
-
-## Usage
-
-```
-jg QUERY [PATH ...]
-```
-
-| Flag | Meaning |
-|---|---|
-| `-e QUERY` | extra query answered in the same pass (repeatable); files are read and sent once |
-| `-f, --filter TEXT` | plain-language include/exclude rules, see above |
-| `--only CAT`, `--not CAT` | one category each, no parsing; repeatable |
-| `-l, --files` | rank files only, no region or line scoring; about 3x cheaper |
-| `-b, --broad` | flag every line related to the query, not only the lines that answer it |
-| `-t 0.5` | minimum probability for a region or line to match; raise for precision, lower for recall |
-| `-T 0.6` | file relevance needed for `-l`, or for the weaker tier |
-| `-n 15`, `--max-regions 5`, `-m 10` | max files per query, regions per file, pinpointed lines per file |
-| `-C N` | context lines around each pinpointed line |
-| `-g GLOB`, `-x GLOB` | include or exclude files |
-| `--json` | one object per file: `relevance`, `match` (`strong` or `weak`), `regions[]` each with `start`, `end`, `p`, `label`, `label_line`, `lines[]`, plus top-level `lines[]` for lines outside any shown region |
-| `--no-heading` | flat rows: `path:START-END:prob:label` for regions, `path:LINE:prob:text` for lines; matches only |
-| `--triage` | pre-filter files by path first; automatic above `--max-files` (1500) |
-| `-j N` | concurrent requests (must be positive; default 32). On ChatGPT a search with fewer chunks than lanes is cut into smaller requests to fill them |
-| `--backend jev\|chatgpt\|openai` | decision backend; default `jev`, or `$JG_BACKEND`. `openai` is any OpenAI-compatible service |
-| `--chatgpt-login` | ChatGPT only: run Codex device login, then search; requires a query |
-| `--api-key KEY` | `openai` only: API key; default `$OPENAI_API_KEY` |
-| `--no-schema` | `openai` only: do not ask for structured outputs. `jg` finds this out by itself at the cost of one refused request per concurrent first request; the flag saves those for a model known to lack them |
-| `--extra-body JSON` | `openai` only: request fields to add or override, or `$JG_EXTRA_BODY`; `null` removes a field; `input`, `messages` and `stream` are refused |
-| `--model MODEL` | model, or `$JG_MODEL`. Jev: `jev-latest`. `openai`: required, no default. ChatGPT is `gpt-5.6-luna` only; any other `--model` or `$JG_MODEL` is an error unless `--model gpt-5.6-luna` overrides |
-| `--base-url URL` | override the selected backend endpoint, or `$JG_BASE_URL`; `openai` then honours `$OPENAI_BASE_URL`. For `openai` it is an API root (`https://host/v1`), or a full `/responses` or `/chat/completions` URL to settle which API is spoken. ChatGPT and keyed `openai` requests accept HTTPS, or HTTP on `localhost` / `127.0.0.1` / `::1`, and do not follow redirects |
-| `--color auto\|always\|never` | styling for human output; default `auto` |
-
-Exit status follows grep: `0` matches, `1` none, `2` error. Results go to stdout; progress and the
-stats line go to stderr (`-q` silences them). File discovery honors `.gitignore` and skips
-binaries, lockfiles, and files over 512 KB.
-
-### Parsing, color, and progress
-
-Help and usage errors are generated by clap. Existing short aliases, clustered flags,
-attached values, options after positionals, repeatable collections and last-value-wins
-scalar options are retained. `QUERY` is required even with `-e`; queries are trimmed and
-empty queries removed. Probability thresholds (`-t` and `-T`) must be finite and in
-`[0, 1]`. Jobs and chunk sizes must be positive integers. Other numeric options retain
-their zero behavior (for example, `--top 0` shows no files). Invalid arguments exit 2
-before discovery, key resolution, or API calls.
-
-`--color` controls application presentation, independently for stdout and stderr:
-
-1. JSON and flat result output never receive application-added styling, including
-   files-only output combined with those flags. Payload text and JSON precision/order
-   are preserved. Generated help and usage errors are always plain.
-2. Explicit `always` or `never` overrides color environment settings for eligible human output.
-3. In `auto`, nonempty `NO_COLOR` or `TERM=dumb` disables color. Otherwise, nonempty
-   `CLICOLOR_FORCE` other than `0` forces color, then `CLICOLOR=0` disables it; terminal
-   detection supplies the default.
-
-Human output uses display-column-aware Unicode truncation, with the existing 110-column
-region-label and 200-column line budgets. Color supplements, not replaces, text labels.
-Progress is uncolored, on stderr only, and visible only for an eligible stderr terminal
-when `TERM` is not `dumb` and `-q` is absent. Redirecting stdout does not hide interactive
-stderr progress. Progress is cleared before final results, stats, or errors; notes suspend
-it without losing redirected diagnostics. Quiet suppresses notes/progress/stats, not errors. Explicit `JG_DEBUG` retry logs
-also suspend progress safely and retain their existing quiet-mode behavior.
-
-Explicit `--backend` overrides `JG_BACKEND`; unset or empty environment values use `jev`.
-Explicit `--model`/`--base-url` overrides `JG_MODEL`/`JG_BASE_URL`; unset or empty environment
-values use the selected backend's default. API-key/fnox and ChatGPT credential resolution
-remain outside parsing. `--chatgpt-login` without a ChatGPT backend is a usage error, and so are
-`--api-key`, `--no-schema` and `--extra-body` without `--backend openai`. `JG_MODEL` applies to whichever backend is selected.
-
 ## For coding agents
 
 Paste this into `CLAUDE.md` or `AGENTS.md`:
@@ -343,31 +316,15 @@ every thread pauses briefly and concurrency halves, then grows back on success.
    with or without a schema; one that fails them is asked for again at a higher temperature, at
    most twice. Chunks are never split finer to fill lanes: hosted services ration requests (free
    models on OpenRouter: 20 a minute, 50 or 1000 a day).
-4. **Select** what to show with the rules in `src/results.rs`: a row is printed only if
-   its own probability clears `-t`; no source line appears twice; every shown file carries a
-   location; matches come before near misses.
+4. **Select** what to show: a row is printed only if its own probability clears `-t`; no source
+   line appears twice; every shown file carries a location; matches come before near misses.
 
 Requests that exceed Jev's context are halved and retried. Transient errors retry with
 exponential backoff and jitter.
 
-| Module | Role |
-|---|---|
-| `src/backend.rs` | `DecisionBackend`: `ask(state, questions) -> answers`, plus usage and optional served tier |
-| `src/files.rs` | discovery, block splitting, chunking |
-| `src/filters.rs` | plain-language filter parsing, polar rules |
-| `src/search.rs` | request building, thread fan-out, answer aggregation over any backend |
-| `src/results.rs` | display rules: what is shown, in which tier |
-| `src/client.rs` | Jev HTTP client, retries, adaptive rate limiting |
-| `src/answers.rs` | what a text model needs to answer like Jev: terse wire ids, response schema, reply validation |
-| `src/chatgpt.rs` | ChatGPT Responses client: `gpt-5.6-luna`, requested `priority`, SSE assembly |
-| `src/openai.rs` | any OpenAI-compatible service: `OPENAI_API_KEY` / `OPENAI_BASE_URL`, Responses API with a strict schema, fallbacks to chat completions / no schema / no temperature, `extra_body`, resampling, reported cost |
-| `src/chatgpt_auth.rs` | subscription credential resolution and explicit Codex device login |
-| `src/cli/{args,render,progress,mod}.rs` | typed flags, writer-based presentation, progress lifecycle, execution/exit codes |
-
-`jg` began as a Python prototype (commit `31b4c25`). The Rust port sends byte-identical requests
-and prints identical output; startup went from 160 ms to 2 ms and the installed footprint from
-about 128 MB (CPython plus packages) to 2.8 MB. A search still takes about 2 seconds, because
-that time is spent waiting on the API.
+`jg` began as a Python prototype (commit `31b4c25`). The Rust port sends the same requests
+and prints the same output; a search still takes about 2 seconds, because that time is spent
+waiting on the API.
 
 ## Measured behavior
 
@@ -446,7 +403,7 @@ For a native Linux release-target build, install `musl-tools` and `binutils`, th
 ```bash
 rustup target add --toolchain 1.98.1 x86_64-unknown-linux-musl
 scripts/check.sh target x86_64-unknown-linux-musl
-scripts/check.sh verify target/dist/jevgrep-v0.2.0-x86_64-unknown-linux-musl.tar.gz x86_64-unknown-linux-musl
+scripts/check.sh verify target/dist/jevgrep-v0.3.0-x86_64-unknown-linux-musl.tar.gz x86_64-unknown-linux-musl
 ```
 
 The reusable `.github/workflows/checks.yml` runs the same quality gate and builds/tests
@@ -454,53 +411,44 @@ all three packaged targets on every PR, main push, manual CI run, and release ru
 Native architecture assertions, downloaded-artifact checksums/layout, packaged help/version,
 fake-API smoke and Linux static-linkage checks are required. Only a matching version-tag
 **push**, after every gate succeeds, can publish; manual runs cannot publish, even on a tag.
-External actions use reviewed commit pins. Repository settings are not changed here.
-Recommended required branch-protection check: **`checks / required checks`**, which fails
-unless `checks / quality` and all three `checks / native (<target>)` jobs succeed.
+External actions use reviewed commit pins.
 
 Additional opt-in commands (live calls send fixture code and incur API usage):
 
 ```bash
-fnox exec -- cargo +1.98.1 test --test live -- --ignored  # only with explicit live-test authorization
-cargo +1.98.1 test --test chatgpt_cli                 # local HTTP/SSE ChatGPT CLI tests; no live ChatGPT
-cargo +1.98.1 test --test openai_cli                  # local OpenAI-compatible CLI tests; no live service
-# live check through OpenRouter; send public code only
-fnox run -- sh -c 'OPENAI_API_KEY=$OPENROUTER_API_KEY OPENAI_BASE_URL=https://openrouter.ai/api/v1 jg --backend openai --model MODEL "<query>" <path>'
-cargo +1.98.1 build --release && fnox exec -- python3 bench/bench.py  # separate opt-in benchmark
-JG_DEBUG=1 jg ...                                     # log retry reasons
+# Live Jev tests: only with a key you own, and only on public/fixture code
+export TYPESAFE_API_KEY=...
+cargo test --test live -- --ignored
+
+# Local protocol tests; no live ChatGPT or OpenAI-compatible service
+cargo test --test chatgpt_cli
+cargo test --test openai_cli
+
+# Live openai backend: public code only
+export OPENAI_API_KEY=... OPENAI_BASE_URL=https://openrouter.ai/api/v1
+jg --backend openai --model MODEL "<query>" <path>
+
+cargo build --release && python3 bench/bench.py   # opt-in; needs TYPESAFE_API_KEY
+JG_DEBUG=1 jg ...                                 # log retry reasons
 ```
 
 The Rust integration tests run the real binary against local HTTP servers. The PTY harness
 uses Python's standard library, bounded waits, process reaping and server cleanup; it does
-not snapshot animation timing. `tests/chatgpt_cli.rs` uses a tiny local listener (account
-headers and SSE) with isolated `HOME` / `XDG_*` / `CODEX_HOME` and fake credentials only.
-`tests/openai_cli.rs` does the same for the Responses API and chat completions, with fake keys
-and a fake `fnox` on `PATH` that must never be run. Normal QA and CI
-never send live ChatGPT or OpenAI-compatible requests. Live verification notes are in
-[docs/chatgpt-verification.md](docs/chatgpt-verification.md). `JG_BASE_URL` points `jg` at another
-endpoint, `JG_MODEL` at another model, `JG_BACKEND` at `jev`, `chatgpt` or `openai`, and
-`JG_NO_FNOX=1` disables fnox lookup. The [ADRs](docs/adr/README.md)
-record compatibility decisions and the full option/test inventory.
-
-### Releasing
-
-`version` in `Cargo.toml` is the source of truth, and pushing a `vX.Y.Z` tag is what builds and
-publishes the binaries. Cut a release from a clean `main` with:
-
-```bash
-scripts/release.sh patch --dry-run   # bump, test, show the plan, change nothing
-scripts/release.sh minor             # bump, commit, tag, push, wait for the build, verify
-```
-
-The script refuses to run off `main`, with a dirty tree, or on a tag that already exists; after
-the build it checks that all three tarballs are attached, that the release is the latest one, and
-that `mise exec github:thehumanworks/jevgrep@X.Y.Z -- jg --version` prints the new version. `jg`
-is pre-1.0: user-visible changes, including any change to the wording of the questions sent to
-Jev, are a **minor** bump; fixes and internals are a **patch**. Releases are cut by a coding
-agent, not by hand: [`AGENTS.md`](AGENTS.md) says so and `.claude/skills/release/SKILL.md` spells
-out the rules.
+not snapshot animation timing. `tests/chatgpt_cli.rs` and `tests/openai_cli.rs` use tiny local
+listeners with isolated `HOME` / `XDG_*` / `CODEX_HOME` and fake credentials only. Normal QA
+and CI never send live ChatGPT or OpenAI-compatible requests. `JG_BASE_URL` points `jg` at
+another endpoint, `JG_MODEL` at another model, and `JG_BACKEND` at `jev`, `chatgpt` or
+`openai`. The [ADRs](docs/adr/README.md) record compatibility decisions and the full
+option/test inventory.
 
 The benchmark needs the httpx 0.28.1 source in `bench/corpus/httpx` (gitignored):
 `pip install --no-deps --target bench/corpus httpx==0.28.1`. The A/B experiment scripts for
 question wordings and filter templates were written against the Python prototype and live in
 git history (`git show 31b4c25 --stat -- bench`).
+
+### Releasing
+
+`version` in `Cargo.toml` is the source of truth. Pushing a `vX.Y.Z` tag builds
+and publishes the three host tarballs. Pre-1.0: user-visible changes, including
+question wording sent to Jev, are a **minor** bump; fixes and internals are a
+**patch**. Maintainers can use `scripts/release.sh <patch|minor>`.
