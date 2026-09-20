@@ -1,6 +1,6 @@
 //! The display rules. These exist so jg's output never contradicts itself.
 use jevgrep::files::{chunk_lines, Chunking};
-use jevgrep::results::{filtered_out, select, select_files, Limits, Row};
+use jevgrep::results::{filtered_out, select, select_files, Limits, Row, MAX_WEAK_FILES, WEAK_RATIO};
 use jevgrep::search::{block_label, region_label, BlockHit, FileResult, LineHit};
 
 /// blocks: (start, end, p, keep); lines: (line, p, keep)
@@ -29,6 +29,46 @@ fn spans(v: &jevgrep::results::FileView) -> Vec<(usize, usize, f64)> {
 }
 
 const D: Limits = Limits { threshold: 0.5, file_threshold: 0.6, top: 15, max_regions: 5, max_lines: 10 };
+
+/// The six display rules in results.rs, as assertions any `FileView` must satisfy.
+fn assert_display_rules(v: &jevgrep::results::FileView, threshold: f64) {
+    assert!(!v.rows().is_empty(), "rule 3: a shown file always has a row");
+    let weak_bar = WEAK_RATIO * threshold;
+    for r in &v.regions {
+        assert!(r.p >= if v.weak { weak_bar } else { threshold }, "rule 1/4: region score clears its bar");
+        assert!(r.lines.iter().all(|h| r.start <= h.line && h.line <= r.end));
+        assert!(r.lines.iter().all(|h| h.p >= threshold), "rule 1: nested lines clear threshold");
+        assert_ne!(r.label_line, 0, "a region always has a location");
+    }
+    let shown: Vec<&LineHit> = v.regions.iter().flat_map(|r| &r.lines).chain(&v.lines).collect();
+    assert!(shown.iter().all(|h| h.p >= threshold), "rule 1: stand-alone lines clear threshold");
+    assert!(!(v.weak && !shown.is_empty()), "rule 4: the weak tier has no pinpointed lines");
+    let mut printed: Vec<usize> = v.regions.iter().map(|r| r.label_line).chain(shown.iter().map(|h| h.line)).collect();
+    let count = printed.len();
+    printed.sort_unstable();
+    printed.dedup();
+    assert_eq!(printed.len(), count, "rule 2: no source line printed twice");
+    assert!(v.regions.iter().map(|r| r.p).chain(shown.iter().map(|h| h.p)).all(|p| v.relevance >= p));
+    let order: Vec<usize> = v
+        .rows()
+        .iter()
+        .map(|row| match row {
+            Row::Region(r) => r.start,
+            Row::Line(h) => h.line,
+        })
+        .collect();
+    assert!(order.windows(2).all(|w| w[0] <= w[1]));
+}
+
+fn assert_selection_rules(views: &[jevgrep::results::FileView], lim: &Limits) {
+    assert!(views.len() <= lim.top, "rule 6: the page never exceeds --top");
+    assert!(views.iter().filter(|v| v.weak).count() <= MAX_WEAK_FILES);
+    assert!(views.windows(2).all(|w| w[0].weak <= w[1].weak), "rule 6: matched files come before the weak tier");
+    assert!(views.windows(2).all(|w| w[0].weak != w[1].weak || w[0].relevance + 1e-15 >= w[1].relevance));
+    for v in views {
+        assert_display_rules(v, lim.threshold);
+    }
+}
 
 #[test]
 fn pinpoint_match_shows_region_with_its_lines_nested() {
@@ -121,7 +161,7 @@ fn invariants_hold_for_arbitrary_answers() {
     for _ in 0..500 {
         let t = [0.3, 0.5, 0.8][rng.below(3)];
         let mut results = Vec::new();
-        for f in 0..1 + rng.below(5) {
+        for f in 0..=rng.below(5) {
             let mut starts: Vec<usize> = (0..rng.below(13)).map(|_| 1 + 5 * rng.below(80)).collect();
             starts.sort_unstable();
             starts.dedup();
@@ -131,37 +171,16 @@ fn invariants_hold_for_arbitrary_answers() {
             let lines: Vec<_> = (0..rng.below(41)).map(|_| (1 + rng.below(410), rng.unit() * scale)).collect();
             results.push(file(&format!("f{f}.py"), rng.unit(), &blocks, &lines));
         }
-        let views = select(&results, &Limits { threshold: t, max_regions: 1 + rng.below(6), max_lines: 1 + rng.below(12), ..D });
+        let lim = Limits { threshold: t, max_regions: 1 + rng.below(6), max_lines: 1 + rng.below(12), ..D };
+        let views = select(&results, &lim);
+        assert_selection_rules(&views, &lim);
         for v in &views {
-            assert!(!v.rows().is_empty(), "a shown file always has a row");
-            for r in &v.regions {
-                assert!(r.p >= if v.weak { 0.7 * t } else { t });
-                assert!(r.lines.iter().all(|h| r.start <= h.line && h.line <= r.end));
-            }
-            let shown: Vec<&LineHit> = v.regions.iter().flat_map(|r| &r.lines).chain(&v.lines).collect();
-            assert!(shown.iter().all(|h| h.p >= t) && !(v.weak && !shown.is_empty()));
-            let mut printed: Vec<usize> = v.regions.iter().map(|r| r.label_line).chain(shown.iter().map(|h| h.line)).collect();
-            let count = printed.len();
-            printed.sort_unstable();
-            printed.dedup();
-            assert_eq!(printed.len(), count, "no source line printed twice");
-            assert!(v.regions.iter().map(|r| r.p).chain(shown.iter().map(|h| h.p)).all(|p| v.relevance >= p));
-            let order: Vec<usize> = v
-                .rows()
-                .iter()
-                .map(|row| match row {
-                    Row::Region(r) => r.start,
-                    Row::Line(h) => h.line,
-                })
-                .collect();
-            assert!(order.windows(2).all(|w| w[0] <= w[1]));
             if v.weak {
                 weak_seen += 1
             } else {
                 strong_seen += 1
             }
         }
-        assert!(views.windows(2).all(|w| (w[0].weak, -w[0].relevance) <= (w[1].weak, -w[1].relevance)));
     }
     assert!(strong_seen > 100 && weak_seen > 10, "the generator must exercise both tiers ({strong_seen}, {weak_seen})");
 }
@@ -263,4 +282,67 @@ fn zero_display_caps_retain_existing_selection_semantics() {
     let view = jevgrep::results::view_file(&fr, &Limits { max_regions: 0, max_lines: 0, ..Limits::default() }).unwrap();
     assert!(view.regions.is_empty() && view.lines.is_empty());
     assert_eq!((view.more_regions, view.more_lines, view.weak), (1, 0, false));
+}
+
+#[test]
+fn select_files_keeps_only_gated_rows_in_score_then_path_order() {
+    let mut rng = Rng(3);
+    for _ in 0..200 {
+        let file_threshold = [0.0, 0.4, 0.6, 0.9][rng.below(4)];
+        let top = rng.below(8);
+        let results: Vec<FileResult> = (0..=rng.below(12))
+            .map(|i| filtered(&format!("{}f{i}.py", if rng.below(2) == 0 { "a/" } else { "b/" }), rng.unit(), rng.unit(), &[], &[]))
+            .collect();
+        let kept = select_files(&results, file_threshold, top);
+        assert!(kept.len() <= top);
+        assert!(kept.iter().all(|fr| fr.score >= file_threshold && fr.keep >= jevgrep::filters::FILTER_GATE));
+        let expected = {
+            let mut want: Vec<&FileResult> =
+                results.iter().filter(|fr| fr.score >= file_threshold && fr.keep >= jevgrep::filters::FILTER_GATE).collect();
+            want.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.path.cmp(&b.path)));
+            want.truncate(top);
+            want.iter().map(|fr| fr.path.as_str()).collect::<Vec<_>>()
+        };
+        assert_eq!(kept.iter().map(|fr| fr.path.as_str()).collect::<Vec<_>>(), expected);
+    }
+}
+
+#[test]
+fn filtered_out_counts_only_strong_rows_the_filter_removed() {
+    let mut rng = Rng(5);
+    for _ in 0..150 {
+        let threshold = [0.3, 0.5, 0.8][rng.below(3)];
+        let results: Vec<FileResult> = (0..rng.below(6))
+            .map(|i| {
+                let blocks: Vec<_> = (0..rng.below(5)).map(|_| (1 + rng.below(20), 2 + rng.below(20), rng.unit(), rng.unit())).collect();
+                let lines: Vec<_> = (0..rng.below(8)).map(|_| (1 + rng.below(40), rng.unit(), rng.unit())).collect();
+                filtered(&format!("f{i}.py"), rng.unit(), rng.unit(), &blocks, &lines)
+            })
+            .collect();
+        let (regions, lines) = filtered_out(&results, threshold);
+        let want_regions =
+            results.iter().flat_map(|fr| &fr.blocks).filter(|b| b.p >= threshold && b.keep < jevgrep::filters::FILTER_GATE).count();
+        let want_lines =
+            results.iter().flat_map(|fr| &fr.lines).filter(|h| h.p >= threshold && h.keep < jevgrep::filters::FILTER_GATE).count();
+        assert_eq!((regions, lines), (want_regions, want_lines));
+        let views = select(&results, &Limits { threshold, ..D });
+        assert_selection_rules(&views, &Limits { threshold, ..D });
+        for v in &views {
+            assert!(v.regions.iter().all(|r| r.p >= if v.weak { WEAK_RATIO * threshold } else { threshold }));
+        }
+    }
+}
+
+#[test]
+fn file_rank_is_the_stronger_signal_plus_a_quarter_of_the_weaker() {
+    let cases = [(1.0, 0.0, 1.0), (0.0, 1.0, 1.0), (0.8, 0.4, 0.9), (0.4, 0.8, 0.9), (0.5, 0.5, 0.625)];
+    for (score, evidence, want) in cases {
+        let mut fr = FileResult::new("a.py");
+        fr.score = score;
+        if evidence > 0.0 {
+            fr.blocks.push(BlockHit { start: 1, end: 2, p: evidence, label: "x".into(), label_line: 1, keep: 1.0 });
+        }
+        assert!((fr.rank() - want).abs() < 1e-12, "{} != {want}", fr.rank());
+        assert_eq!(fr.best_evidence(), evidence);
+    }
 }

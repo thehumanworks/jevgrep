@@ -17,7 +17,11 @@ Use `rust-toolchain.toml` as the exact canonical compiler pin. Require Cargo's
 `rust-version` and mise's Rust pin to match it, retaining edition 2021. Invoke
 `cargo +<pin>` explicitly. Future upgrades are reviewed changes to all three pins.
 Keep the narrowly scoped Rust/Clippy lint policy in Cargo; deny Clippy warnings,
-without blanket pedantic rules or bans on test unwraps. Build documentation with
+without blanket pedantic rules or bans on test unwraps. ADR 0006 records the later
+correctness-first Clippy set (deny `correctness`/`suspicious`, cherry-pick only the
+pedantic/restriction lints that catch bugs here). ADR 0007 records how requirements
+are stated as tests. ADR 0008 adds a local pre-commit hook that runs a fast subset
+of this gate. Build documentation with
 `RUSTDOCFLAGS=-D warnings` as well as running doctests.
 
 Provide one fail-fast `scripts/check.sh` for required local and CI checks. Tool

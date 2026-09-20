@@ -105,6 +105,55 @@ fn filter_questions_are_positive_atomic_and_outside_state() {
 }
 
 #[test]
+fn request_question_ids_cover_every_askable_line_block_and_filter_term() {
+    let lines = ["import os", "", "def f():", "    return os.getcwd()", "x = 1"];
+    let chunk = &chunk_lines("a.py", &lines, Chunking::default())[0];
+    let cases: &[(&[&str], bool, bool, Option<&str>)] = &[
+        (&["q"], false, false, None),
+        (&["q"], false, true, None),
+        (&["q"], true, false, None),
+        (&["one", "two"], false, false, Some("source code only. no tests")),
+        (&["q"], true, false, Some("no tests")),
+    ];
+    for &(qs, files_only, broad, filter) in cases {
+        let rules = filter.map(parse_filter);
+        let (_, questions) = build_request(&queries(qs), chunk, files_only, broad, rules.as_ref());
+        for (i, _) in qs.iter().enumerate() {
+            assert!(questions.contains_key(&format!("q{i}.rel")), "{qs:?} missing relevance");
+            if files_only {
+                assert!(questions.keys().filter(|k| k.starts_with(&format!("q{i}.B")) || k.starts_with(&format!("q{i}.L"))).count() == 0);
+            } else {
+                for &(a, b) in &chunk.blocks {
+                    assert!(questions.contains_key(&format!("q{i}.B{a}-{b}")));
+                }
+                for n in chunk.askable() {
+                    assert!(questions.contains_key(&format!("q{i}.L{n}")));
+                    let text = questions[&format!("q{i}.L{n}")]["instructions"].as_str().unwrap();
+                    if broad {
+                        assert!(text.contains("relevant to"), "{text}");
+                    } else {
+                        assert!(text.contains("directly answer"), "{text}");
+                    }
+                }
+            }
+        }
+        if let Some(rules) = &rules {
+            for (t, _) in rules.terms().iter().enumerate() {
+                assert!(questions.contains_key(&format!("F{t}.S")));
+                if files_only {
+                    assert!(questions.keys().all(|k| !k.starts_with(&format!("F{t}.B"))));
+                } else {
+                    for &(a, b) in &chunk.blocks {
+                        assert!(questions.contains_key(&format!("F{t}.B{a}-{b}")));
+                    }
+                }
+            }
+        }
+        assert!(questions.values().all(|q| q.get("type").and_then(Value::as_str).is_some()));
+    }
+}
+
+#[test]
 fn search_aggregates_ranks_and_handles_multiple_queries() {
     let hay: Vec<String> = (0..400).map(|i| format!("hay_{i} = {i}")).collect();
     let mut target = vec!["a = 1"; 200];

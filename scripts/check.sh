@@ -88,13 +88,14 @@ case "$mode" in
       echo 'ShellCheck 0.11.0 required; run scripts/install-qa-tools.sh' >&2; exit 1;
     }
     actionlint
-    shellcheck scripts/*.sh
+    shellcheck scripts/*.sh scripts/githooks/*
     python3 -m unittest discover -s scripts -p 'test_*.py'
     git diff --check
     rust_versions
     step 'Formatting'
     cargo +"$pin" fmt --all -- --check
     step 'Clippy'
+    # Lint levels are declared in Cargo.toml (ADR 0006). -D warnings is the shared fail-closed flag.
     cargo +"$pin" clippy --locked --all-targets --all-features -- -D warnings
     step 'Tests (ignored live tests stay ignored)'
     cargo +"$pin" test --locked --all-targets --all-features

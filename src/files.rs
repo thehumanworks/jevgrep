@@ -147,9 +147,8 @@ pub fn fnmatch(text: &str, pattern: &str) -> bool {
                 '?' => step = Some(pi + 1),
                 '[' => match class(&p, pi, t[ti]) {
                     Some((true, next)) => step = Some(next),
-                    Some((false, _)) => {}
                     None if t[ti] == '[' => step = Some(pi + 1),
-                    None => {}
+                    _ => {}
                 },
                 c if c == t[ti] => step = Some(pi + 1),
                 _ => {}
@@ -338,7 +337,7 @@ pub fn read_lines(path: &Path) -> Option<Vec<String>> {
 pub fn clip(line: &str) -> String {
     let line = line.trim_end();
     match line.char_indices().nth(MAX_LINE_CHARS) {
-        Some((at, _)) => format!("{} ...", &line[..at]),
+        Some((at, _)) => format!("{} ...", line.get(..at).unwrap_or(line)),
         None => line.to_owned(),
     }
 }
@@ -355,8 +354,8 @@ pub fn is_definition(line: &str) -> bool {
             Regex::new(concat!(
                 r"^\s*(?:(?:export|default|pub(?:\([a-z]+\))?|public|private|protected|internal|static|final|abstract|",
                 r"async|unsafe|extern|inline|virtual|override|const)\s+)*",
-                r"(?:def|class|fn|func|function|impl|struct|enum|trait|interface|type|module|mod|namespace|object|record|",
-                r"macro_rules!|sub|proc|procedure|package)\b",
+                r"(?:macro_rules!|(?:def|class|fn|func|function|impl|struct|enum|trait|interface|type|module|mod|",
+                r"namespace|object|record|sub|proc|procedure|package)\b)",
             ))
             .expect("valid regex")
         })

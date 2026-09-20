@@ -395,8 +395,24 @@ It checks synchronized pins, helper scripts, every workflow, formatting, Clippy 
 warnings denied, all targets/features, doctests, the host release build and bounded
 fake-API/PTY tests. It isolates HOME, XDG paths, global Git configuration, application
 environment and credentials while intentionally retaining the compiler and Cargo cache.
-Normal QA and CI **never run ignored live tests**. Rust forbids unsafe code; Clippy denies
-`dbg!`, `todo!` and `unimplemented!` without blanket pedantic/restriction policies.
+Normal QA and CI **never run ignored live tests**. Rust forbids unsafe code. Clippy denies
+the `correctness` and `suspicious` groups plus a short, named list of pedantic/restriction
+lints that catch real bugs here (UTF-8 slices, forgotten struct fields, off-by-one ranges).
+There is no blanket `pedantic` or `restriction` policy. Lint levels live in `Cargo.toml`
+so every Clippy invocation uses the same rules; `scripts/check.sh` still passes
+`-D warnings`. See [ADR 0006](docs/adr/0006-clippy-correctness.md).
+
+Install the optional git hook so formatting, Clippy, and the test suite run on every
+commit. `scripts/pre-commit.sh` is that fast gate: the same Clippy command as CI, without
+isolation, workflow lint, rustdoc, the release build, or the PTY harness
+([ADR 0008](docs/adr/0008-pre-commit-hook.md)):
+
+```bash
+scripts/install-git-hooks.sh
+```
+
+Skip one commit with `JG_SKIP_HOOKS=1` or `SKIP=1`. The hook does not install extra tools
+and does not run ignored live tests. `scripts/check.sh` remains the full isolated gate.
 
 For a native Linux release-target build, install `musl-tools` and `binutils`, then:
 

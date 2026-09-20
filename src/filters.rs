@@ -118,9 +118,9 @@ pub fn parse_filter(text: &str) -> Rules {
                 continue;
             }
             if let Some(m) = pat.exclude.find(part) {
-                (exclude, part) = (true, &part[m.end()..]);
+                (exclude, part) = (true, part.get(m.end()..).unwrap_or(""));
             } else if let Some(m) = pat.include.find(part) {
-                (exclude, part) = (false, &part[m.end()..]);
+                (exclude, part) = (false, part.get(m.end()..).unwrap_or(""));
             }
             let stripped = pat.only_suffix.replace(part, "");
             if stripped.len() != part.len() {
