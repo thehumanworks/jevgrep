@@ -90,7 +90,7 @@ fn questions() -> Map<String, Value> {
 fn posts_json_with_a_bearer_token_and_the_configured_user_agent() {
     let (url, seen) =
         serve(|_| (200, vec![], json!({"answers": {"q": {"type": "noul", "noul": 0.7}}, "usage": {"input_tokens": 9}}).to_string()));
-    let c = Client::new("sk-test", Config { base_url: url, user_agent: "probe/1.0".into(), ..Config::default() });
+    let c = Client::new("sk-test", Config { base_url: url, user_agent: "probe/1.0".into(), ..Config::default() }).unwrap();
     let answers = c.ask(&json!({"n": 1}), &questions()).unwrap();
     assert_eq!(answers["q"]["noul"], 0.7);
     assert_eq!((c.usage().requests(), c.usage().input_tokens(), c.usage().output_tokens()), (1, 9, 0));
@@ -110,7 +110,7 @@ fn posts_json_with_a_bearer_token_and_the_configured_user_agent() {
 #[test]
 fn the_default_user_agent_names_this_crate() {
     let (url, seen) = serve(|_| (200, vec![], json!({"answers": {}}).to_string()));
-    let c = Client::new("sk-test", Config { base_url: url, ..Config::default() });
+    let c = Client::new("sk-test", Config { base_url: url, ..Config::default() }).unwrap();
     assert!(c.ask(&json!({}), &Map::new()).unwrap().is_empty());
     let seen = seen.lock().unwrap();
     let agent = seen[0].header("user-agent").unwrap();
@@ -126,9 +126,9 @@ fn status_and_retry_after_reach_the_client() {
         (429, vec![("Retry-After", "0".into())], r#"{"detail": "slow down"}"#.into())
     });
     let cfg = Config { base_url: url, max_retries: 1, backoff_scale: 0.0, throttle_pause: Duration::ZERO, ..Config::default() };
-    let bad = Client::new("wrong", cfg.clone());
+    let bad = Client::new("wrong", cfg.clone()).unwrap();
     assert!(matches!(bad.ask(&json!({}), &questions()), Err(Error::Auth(m)) if m.contains("HTTP 401") && m.contains("bad key")));
-    let mut good = Client::new("good", cfg);
+    let mut good = Client::new("good", cfg).unwrap();
     let messages = Arc::new(Mutex::new(Vec::new()));
     let reported = Arc::clone(&messages);
     good.set_debug_reporter(move |message| reported.lock().unwrap().push(message.to_owned()));
@@ -144,8 +144,38 @@ fn an_unreachable_endpoint_is_retried_then_reported() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}/", listener.local_addr().unwrap());
     drop(listener);
-    let c = Client::new("sk", Config { base_url: url, max_retries: 1, backoff_scale: 0.0, ..Config::default() });
+    let c = Client::new("sk", Config { base_url: url, max_retries: 1, backoff_scale: 0.0, ..Config::default() }).unwrap();
     let err = c.ask(&json!({}), &questions()).unwrap_err();
     assert!(matches!(&err, Error::Api(m) if m.starts_with("gave up after 1 retries")), "{err:?}");
     assert_eq!(c.usage().retries(), 1);
+}
+
+#[test]
+fn a_key_or_a_config_that_cannot_be_sent_is_refused_before_any_request() {
+    let (url, seen) = serve(|_| (200, vec![], json!({"answers": {}}).to_string()));
+    let at = |base_url: &str| Config { base_url: base_url.into(), ..Config::default() };
+    for key in ["", "  \n", "sk\nsecret-half", "sk-\u{7f}"] {
+        let err = Client::new(key, at(&url)).unwrap_err();
+        assert!(matches!(&err, Error::Auth(m) if m.starts_with("the API key") && !m.contains("secret")), "{key:?} -> {err:?}");
+    }
+    for base_url in ["", "not a url", "api.typesafe.ai/v1/systemone", "ftp://example.com/x", "/v1/systemone", "https://"] {
+        let err = Client::new("sk", at(base_url)).unwrap_err();
+        assert!(matches!(&err, Error::InvalidConfig(m) if m.contains("`Config::base_url`")), "{base_url:?} -> {err:?}");
+    }
+    let err = Client::new("sk", at("https://user:hunter2@exa mple.com/")).unwrap_err();
+    assert!(!err.message().contains("hunter2"), "a URL's credentials stay out of the message: {err:?}");
+    let err = Client::new("sk", Config { user_agent: "line\nbreak".into(), ..at(&url) }).unwrap_err();
+    assert!(matches!(&err, Error::InvalidConfig(m) if m.contains("`Config::user_agent`")), "{err:?}");
+    assert!(seen.lock().unwrap().is_empty(), "nothing was sent");
+}
+
+#[test]
+fn whitespace_around_the_key_is_dropped_and_debug_output_omits_the_key() {
+    let (url, seen) = serve(|_| (200, vec![], json!({"answers": {}}).to_string()));
+    let c = Client::new(" sk-from-a-file\n", Config { base_url: url, ..Config::default() }).unwrap();
+    c.ask(&json!({}), &Map::new()).unwrap();
+    assert_eq!(seen.lock().unwrap()[0].header("authorization"), Some("Bearer sk-from-a-file"));
+    let shown = format!("{c:?}");
+    assert!(shown.starts_with("Client {") && shown.contains("jev-latest") && shown.contains("requests: 1"), "{shown}");
+    assert!(!shown.contains("sk-from-a-file"), "{shown}");
 }

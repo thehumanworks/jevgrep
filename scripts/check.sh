@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Required local and CI QA. Install tools separately with install-qa-tools.sh.
-# Usage: check.sh [quality | target TARGET | verify ARCHIVE TARGET]
+# Usage: check.sh [quality | crate | target TARGET | verify ARCHIVE TARGET]
 set -euo pipefail
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root"
@@ -108,6 +108,19 @@ case "$mode" in
     "$binary" --help >/dev/null
     "$binary" --version
     python3 scripts/terminal-smoke.py --binary "$binary" --pty
+    ;;
+  crate)
+    # The published client crate, as its users meet it: on its own minimum supported Rust,
+    # which is older than jg's pin, and as the archive crates.io would receive.
+    [[ $# == 0 ]] || { echo 'crate takes no arguments' >&2; exit 2; }
+    msrv=$(python3 -c 'import sys, tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["package"]["rust-version"])' \
+      crates/typesafe-jev/Cargo.toml)
+    rustc +"$msrv" --version
+    step "typesafe-jev tests and doctests on its MSRV, Rust $msrv"
+    cargo +"$msrv" test --locked -p typesafe-jev --all-targets
+    cargo +"$msrv" test --locked -p typesafe-jev --doc
+    step 'typesafe-jev packages and builds from the package alone'
+    cargo +"$msrv" package --locked -p typesafe-jev --allow-dirty
     ;;
   target)
     [[ $# == 1 ]] || { echo 'usage: check.sh target TARGET' >&2; exit 2; }

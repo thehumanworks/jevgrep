@@ -1,5 +1,6 @@
+use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Condvar, Mutex};
+use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 /// Uniform in [0, 1). Only used for retry and pause jitter, so a tiny xorshift is plenty.
@@ -47,21 +48,28 @@ impl AdaptiveLimiter {
         AdaptiveLimiter { max, pause, gate: Mutex::new(Gate { limit: max, in_flight: 0, paused_until: None }), cv: Condvar::new() }
     }
 
+    /// The gate is three plain numbers that every critical section leaves consistent, so a lock
+    /// poisoned by a panicking thread is still good to use.
+    fn gate(&self) -> MutexGuard<'_, Gate> {
+        self.gate.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// The current concurrency limit. Starts at the ceiling, halves on throttling, grows back on
-    /// success; never below one.
+    /// success; never below one. Fractional, because it grows by a fraction of a slot per reply;
+    /// the whole part is the number of attempts allowed at once.
     pub fn limit(&self) -> f64 {
-        self.gate.lock().unwrap().limit
+        self.gate().limit
     }
 
     /// Attempts between `acquire` and `release` right now.
     pub fn in_flight(&self) -> usize {
-        self.gate.lock().unwrap().in_flight
+        self.gate().in_flight
     }
 
     /// Blocks until there is a free slot under the current limit and no pause is in effect.
     /// Every `acquire` must be matched by one [`release`](Self::release).
     pub fn acquire(&self) {
-        let mut gate = self.gate.lock().unwrap();
+        let mut gate = self.gate();
         loop {
             let wait = gate.paused_until.and_then(|t| t.checked_duration_since(Instant::now())).filter(|d| !d.is_zero());
             match wait {
@@ -69,28 +77,45 @@ impl AdaptiveLimiter {
                     gate.in_flight += 1;
                     return;
                 }
-                None => gate = self.cv.wait(gate).unwrap(),
-                Some(d) => gate = self.cv.wait_timeout(gate, d.max(Duration::from_millis(50))).unwrap().0,
+                None => gate = self.cv.wait(gate).unwrap_or_else(PoisonError::into_inner),
+                Some(d) => {
+                    gate = self.cv.wait_timeout(gate, d.max(Duration::from_millis(50))).unwrap_or_else(PoisonError::into_inner).0;
+                }
             }
         }
     }
 
     /// Frees the slot. `throttled` reports a rate-limited reply (HTTP 429 or 529): the limit
     /// halves and every thread pauses, once per throttling episode rather than once per reply.
-    /// Any other outcome grows the limit by about one slot per round of requests.
+    /// Any other outcome grows the limit by about one slot per round of requests. A `release`
+    /// without an `acquire` frees nothing.
     pub fn release(&self, throttled: bool) {
-        let mut gate = self.gate.lock().unwrap();
-        gate.in_flight -= 1;
+        let mut gate = self.gate();
+        gate.in_flight = gate.in_flight.saturating_sub(1);
         let now = Instant::now();
         if throttled {
             if gate.paused_until.is_none_or(|t| now >= t) {
                 gate.limit = (gate.limit / 2.0).max(1.0);
-                gate.paused_until = Some(now + self.pause.mul_f64(1.0 + jitter()));
+                // A pause too long to represent is no pause, not a panic with the lock held.
+                let pause = Duration::try_from_secs_f64(self.pause.as_secs_f64() * (1.0 + jitter())).ok();
+                gate.paused_until = pause.and_then(|pause| now.checked_add(pause));
             }
         } else {
             gate.limit = self.max.min(gate.limit + 1.0 / gate.limit.max(1.0));
         }
         self.cv.notify_all();
+    }
+}
+
+impl fmt::Debug for AdaptiveLimiter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let gate = self.gate();
+        f.debug_struct("AdaptiveLimiter")
+            .field("max", &self.max)
+            .field("pause", &self.pause)
+            .field("limit", &gate.limit)
+            .field("in_flight", &gate.in_flight)
+            .finish_non_exhaustive()
     }
 }
 
@@ -137,6 +162,20 @@ mod tests {
             limiter.release(true);
         }
         assert_eq!(limiter.limit(), 1.0);
+    }
+
+    #[test]
+    fn an_unmatched_release_and_an_unrepresentable_pause_do_not_panic() {
+        let limiter = AdaptiveLimiter::new(2, Duration::MAX);
+        limiter.release(false);
+        assert_eq!(limiter.in_flight(), 0);
+        limiter.acquire();
+        limiter.release(true);
+        assert_eq!((limiter.limit(), limiter.in_flight()), (1.0, 0));
+        limiter.acquire(); // no pause took effect, so this returns
+        limiter.release(false);
+        let shown = format!("{limiter:?}");
+        assert!(shown.starts_with("AdaptiveLimiter {") && shown.contains("in_flight: 0"), "{shown}");
     }
 
     #[test]

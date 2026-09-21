@@ -6,13 +6,17 @@ rust-version = "1.85"
 description = "Client for TypeSafe's System One API and its Jev model: calibrated answers to typed questions about JSON state, with retries, adaptive concurrency and usage accounting"
 readme = "README.md"
 repository = "https://github.com/thehumanworks/jevgrep"
+homepage = "https://github.com/thehumanworks/jevgrep/tree/main/crates/typesafe-jev"
+documentation = "https://docs.rs/typesafe-jev"
 license = "MIT OR Apache-2.0"
 keywords = ["typesafe", "jev", "system-one", "api-client", "classification"]
-categories = ["api-bindings"]
+categories = ["api-bindings", "web-programming::http-client"]
+include = ["/src", "/tests", "/examples", "/README.md", "/CHANGELOG.md", "/LICENSE-*"]
 
 [dependencies]
-serde_json = "1"
-ureq = { version = "3", default-features = false, features = ["rustls", "gzip"] }
+# Both floors are tested: the crate's suite passes on exactly these versions.
+serde_json = "1.0.45"
+ureq = { version = "3.0.0", default-features = false, features = ["rustls", "gzip"] }
 
 [lints]
 workspace = true

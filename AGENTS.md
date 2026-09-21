@@ -53,7 +53,10 @@ again. Changes that do not alter the binary (docs, tests, CI, this file) need no
   per service: an OpenAI-compatible service is a base URL, a key and a model (ADR 0005).
 - The Jev HTTP client is the `typesafe-jev` crate in `crates/typesafe-jev`, a workspace member
   with its own README, tests and version (ADR 0009). It must stay free of `jg` policy: no `fnox`,
-  no `JG_*` variables, no `jg` in messages. Root `cargo test` / `clippy` / `doc` cover it.
+  no `JG_*` variables, no `jg` in messages. Root `cargo test` / `clippy` / `doc` cover it, and
+  `scripts/check.sh crate` tests it on its own MSRV and as a package. It is a published API
+  (ADR 0010): a change to it gets an entry in `crates/typesafe-jev/CHANGELOG.md`, and a breaking
+  one bumps the crate's minor version.
   `scripts/release.sh` releases `jg` only; publishing the crate is `cargo publish -p typesafe-jev`,
   a separate act that the maintainer asks for by name. A change to the crate that alters what `jg`
   sends or accepts on the wire is a `jg` change too and follows the release rules above.

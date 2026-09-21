@@ -422,6 +422,10 @@ scripts/check.sh target x86_64-unknown-linux-musl
 scripts/check.sh verify target/dist/jevgrep-v0.3.0-x86_64-unknown-linux-musl.tar.gz x86_64-unknown-linux-musl
 ```
 
+`scripts/check.sh crate` tests the [`typesafe-jev`](crates/typesafe-jev/README.md) crate on its
+own minimum supported Rust (`rustup toolchain install 1.85 --profile minimal`), which is older
+than `jg`'s pin, and builds it from the package crates.io would receive.
+
 The reusable `.github/workflows/checks.yml` runs the same quality gate and builds/tests
 all three packaged targets on every PR, main push, manual CI run, and release run.
 Native architecture assertions, downloaded-artifact checksums/layout, packaged help/version,

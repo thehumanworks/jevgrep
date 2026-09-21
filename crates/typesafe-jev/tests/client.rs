@@ -225,3 +225,46 @@ fn errors_display_their_message_and_compare_by_value() {
     let boxed: Box<dyn std::error::Error> = Box::new(err);
     assert_eq!(boxed.to_string(), "too big");
 }
+
+#[test]
+fn a_panicking_transport_gives_its_slot_back() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&calls);
+    let c = Arc::new(client(Config { pool_size: 1, ..Config::default() }, move |_| match seen.fetch_add(1, Ordering::SeqCst) {
+        0 => panic!("transport bug"),
+        _ => ok(answers()),
+    }));
+    let doomed = Arc::clone(&c);
+    assert!(std::thread::spawn(move || doomed.ask(&json!({}), &questions())).join().is_err());
+    assert_eq!(c.limiter().in_flight(), 0);
+    assert_eq!(c.ask(&json!({}), &questions()).unwrap()["hit"]["noul"], 0.95, "the only slot is free again");
+}
+
+#[test]
+fn senseless_backoff_settings_mean_no_wait_rather_than_a_panic() {
+    for backoff_scale in [f64::NAN, f64::INFINITY, -1.0, f64::MAX] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&calls);
+        let handler = move |_: &[u8]| match seen.fetch_add(1, Ordering::SeqCst) {
+            0 => Ok(Reply { status: 503, retry_after: Some("30".into()), body: "later".into() }),
+            _ => ok(answers()),
+        };
+        let cfg = Config {
+            backoff_scale,
+            max_backoff: Duration::MAX,
+            max_retries: u32::MAX,
+            throttle_pause: Duration::ZERO,
+            ..Config::default()
+        };
+        let c = Client::with_transport(handler, cfg);
+        assert!(c.ask(&json!({}), &questions()).is_ok(), "backoff_scale {backoff_scale}");
+        assert_eq!(c.usage().retries(), 1);
+    }
+}
+
+#[test]
+fn errors_are_open_to_new_variants_and_every_variant_has_a_message() {
+    for err in [Error::Auth("m".into()), Error::TokenLimit("m".into()), Error::InvalidConfig("m".into()), Error::Api("m".into())] {
+        assert_eq!((err.message(), err.to_string().as_str()), ("m", "m"));
+    }
+}

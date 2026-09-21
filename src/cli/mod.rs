@@ -10,7 +10,7 @@ pub use render::{render_files, render_json, render_text};
 use std::ffi::OsString;
 use std::io::{self, IsTerminal, Write};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::backend::{DecisionBackend, DecisionError};
 use crate::chatgpt::{ChatGptClient, ChatGptConfig};
@@ -260,7 +260,7 @@ fn build_backend(args: &Args, progress: &Arc<Progress>) -> Result<Box<dyn Decisi
                 user_agent: USER_AGENT.into(),
                 ..Config::default()
             };
-            let mut client = JevClient::new(&key, cfg);
+            let mut client = JevClient::new(&key, cfg)?;
             if debug {
                 client.set_debug_reporter(reporter);
             }
@@ -290,12 +290,12 @@ fn build_backend(args: &Args, progress: &Arc<Progress>) -> Result<Box<dyn Decisi
                     // a retry is soon and often: waiting longer only made one unlucky request the
                     // whole search's tail.
                     max_retries: 16,
-                    max_backoff: 2.0,
+                    max_backoff: Duration::from_secs(2),
                     pool_size: args.jobs.max(8),
                     user_agent: USER_AGENT.into(),
                     ..Config::default()
                 };
-                let mut client = JevClient::new(&key, cfg);
+                let mut client = JevClient::new(&key, cfg)?;
                 if debug {
                     client.set_debug_reporter(reporter);
                 }
