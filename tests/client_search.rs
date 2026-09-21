@@ -1,17 +1,17 @@
 mod common;
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{json, Map, Value};
 
 use common::answer_all;
-use jevgrep::client::{Config, JevClient, JevError, Reply};
+use jevgrep::backend::DecisionError;
 use jevgrep::files::{chunk_lines, Chunking};
 use jevgrep::filters::parse_filter;
 use jevgrep::search::{build_request, search, Options};
+use typesafe_jev::{Client as JevClient, Config, Reply};
 
 fn ok(body: String) -> Result<Reply, String> {
     Ok(Reply { status: 200, retry_after: None, body })
@@ -23,10 +23,7 @@ fn status(status: u16, body: &str) -> Result<Reply, String> {
 
 fn client(cfg: Config, handler: impl Fn(&Value) -> Result<Reply, String> + Send + Sync + 'static) -> JevClient {
     let transport = move |raw: &[u8]| handler(&serde_json::from_slice(raw).unwrap());
-    let mut c = JevClient::with_transport(Box::new(transport), cfg);
-    c.backoff = 0.0;
-    c.limiter.pause = Duration::ZERO;
-    c
+    JevClient::with_transport(transport, Config { backoff_scale: 0.0, throttle_pause: Duration::ZERO, ..cfg })
 }
 
 fn queries(qs: &[&str]) -> Vec<String> {
@@ -186,8 +183,8 @@ fn search_aggregates_ranks_and_handles_multiple_queries() {
     assert!(res[0][1..].iter().flat_map(|fr| &fr.lines).all(|h| h.p < 0.5));
     assert_eq!(top.lines.len(), 251); // every non-blank line scored exactly once
     assert!(top.lines.windows(2).all(|w| w[0].line < w[1].line));
-    let requests = c.usage.requests() as usize;
-    assert!(requests >= 4 && c.usage.input_tokens() == 100 * requests as u64); // both queries share each request
+    let requests = c.usage().requests() as usize;
+    assert!(requests >= 4 && c.usage().input_tokens() == 100 * requests as u64); // both queries share each request
     assert_eq!(ticks.last(), Some(&(requests, requests)));
     assert!(threads.lock().unwrap().len() > 1); // requests really ran on multiple threads
 }
@@ -221,78 +218,14 @@ fn token_limit_on_single_line_is_an_error_instead_of_empty_success() {
     let files = scratch("unsplittable", &[("one.py", "needle = 1\n".into())]);
     let c = client(Config::default(), |_| status(413, "context limit"));
     let result = search(&c, &queries(&["needle"]), &files, &Options::default(), |_, _| {}, |_| {});
-    assert!(matches!(result, Err(JevError::TokenLimit(_))));
-}
-
-#[test]
-fn retries_on_429_then_succeeds_and_limiter_recovers() {
-    let calls = Arc::new(AtomicUsize::new(0));
-    let seen = calls.clone();
-    let mut c = client(Config { pool_size: 16, ..Config::default() }, move |body| {
-        if seen.fetch_add(1, Ordering::SeqCst) < 2 {
-            status(429, r#"{"detail": {"message": "Rate limit exceeded"}}"#)
-        } else {
-            ok(answer_all(body, &["needle"]))
-        }
-    });
-    let messages = Arc::new(Mutex::new(Vec::new()));
-    let reported = Arc::clone(&messages);
-    c.set_debug_reporter(move |message| reported.lock().unwrap().push(message.to_owned()));
-    let chunk = &chunk_lines("a.py", &["needle"], Chunking::default())[0];
-    let (state, questions) = build_request(&queries(&["q"]), chunk, false, false, None);
-    let answers = c.ask(&state, &questions).unwrap();
-    let messages = messages.lock().unwrap();
-    assert_eq!(messages.len(), 2);
-    assert!(messages[0].starts_with("attempt 1:") && messages[1].starts_with("attempt 2:"));
-    assert!(messages.iter().all(|message| message.contains("429")));
-    assert_eq!(answers["q0.L1"]["noul"], 0.95);
-    assert_eq!((c.usage.retries(), c.usage.requests(), calls.load(Ordering::SeqCst)), (2, 1, 3));
-    assert!(c.limiter.limit() < 16.0 && c.limiter.in_flight() == 0);
-}
-
-#[test]
-fn connection_failures_are_retried() {
-    let calls = Arc::new(AtomicUsize::new(0));
-    let seen = calls.clone();
-    let c = client(Config::default(), move |_| {
-        if seen.fetch_add(1, Ordering::SeqCst) == 0 {
-            Err("connection reset".into())
-        } else {
-            ok(r#"{"answers": {}}"#.into())
-        }
-    });
-    assert!(c.ask(&json!({}), &Map::new()).unwrap().is_empty());
-    assert_eq!(c.usage.retries(), 1);
-}
-
-#[test]
-fn auth_error_is_not_retried() {
-    let calls = Arc::new(AtomicUsize::new(0));
-    let seen = calls.clone();
-    let c = client(Config::default(), move |_| {
-        seen.fetch_add(1, Ordering::SeqCst);
-        status(401, r#"{"detail": "bad key"}"#)
-    });
-    assert!(matches!(c.ask(&json!({}), &Map::new()), Err(JevError::Auth(_))));
-    assert_eq!(calls.load(Ordering::SeqCst), 1);
-}
-
-#[test]
-fn gives_up_after_max_retries_and_reports_other_errors_at_once() {
-    let c = client(Config { max_retries: 2, ..Config::default() }, |_| status(529, "overloaded"));
-    let err = c.ask(&json!({}), &Map::new()).unwrap_err();
-    assert!(matches!(&err, JevError::Api(m) if m.contains("gave up after 2 retries") && m.contains("overloaded")), "{err}");
-    assert_eq!(c.usage.retries(), 2);
-    let c = client(Config::default(), |_| status(422, "bad question"));
-    assert_eq!(c.ask(&json!({}), &Map::new()), Err(JevError::Api("HTTP 422: bad question".into())));
-    assert_eq!(c.usage.retries(), 0);
+    assert!(matches!(result, Err(DecisionError::TokenLimit(_))));
 }
 
 #[test]
 fn a_search_where_every_request_fails_is_an_error_and_a_partial_one_is_noted() {
     let files = scratch("failing", &[("a.py", "needle = 1\n".into()), ("b.py", "other = 2\n".into())]);
     let c = client(Config::default(), |_| status(422, "nope"));
-    assert!(matches!(search(&c, &queries(&["q"]), &files, &Options::default(), |_, _| {}, |_| {}), Err(JevError::Api(_))));
+    assert!(matches!(search(&c, &queries(&["q"]), &files, &Options::default(), |_, _| {}, |_| {}), Err(DecisionError::Api(_))));
     let c = client(Config::default(), |body| {
         if body["state"]["file"].as_str().unwrap().ends_with("b.py") {
             status(422, "nope")

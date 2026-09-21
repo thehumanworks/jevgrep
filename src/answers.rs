@@ -7,7 +7,7 @@
 
 use serde_json::{json, Map, Value};
 
-use crate::client::JevError;
+use crate::backend::DecisionError;
 
 /// OpenAI's structured outputs top out here, and the ChatGPT endpoint with them. Hitting a limit is
 /// a `TokenLimit`, so callers that can split their questions (search.rs splits the chunk) do so
@@ -32,16 +32,16 @@ pub(crate) fn props(pairs: impl IntoIterator<Item = (&'static str, Value)>) -> M
 }
 
 /// `criteria` as a list of level descriptions, or a clear error.
-fn criteria_of(qid: &str, question: &Value) -> Result<Vec<String>, JevError> {
+fn criteria_of(qid: &str, question: &Value) -> Result<Vec<String>, DecisionError> {
     let listed = question
         .get("criteria")
         .and_then(Value::as_array)
-        .ok_or_else(|| JevError::Api(format!("question `{qid}` is type `score` but has no `criteria` array")))?;
+        .ok_or_else(|| DecisionError::Api(format!("question `{qid}` is type `score` but has no `criteria` array")))?;
     let criteria: Option<Vec<String>> = listed.iter().map(|c| c.as_str().map(str::to_owned)).collect();
     match criteria {
         Some(criteria) if !criteria.is_empty() => Ok(criteria),
-        Some(_) => Err(JevError::Api(format!("question `{qid}` has an empty `criteria` array"))),
-        None => Err(JevError::Api(format!("question `{qid}` has non-string entries in `criteria`"))),
+        Some(_) => Err(DecisionError::Api(format!("question `{qid}` has an empty `criteria` array"))),
+        None => Err(DecisionError::Api(format!("question `{qid}` has non-string entries in `criteria`"))),
     }
 }
 
@@ -53,7 +53,7 @@ fn percentage() -> Value {
 }
 
 /// The schema for one answer, in the terse wire shape `INSTRUCTIONS` describes.
-fn answer_schema(qid: &str, question: &Value) -> Result<Value, JevError> {
+fn answer_schema(qid: &str, question: &Value) -> Result<Value, DecisionError> {
     match question.get("type").and_then(Value::as_str) {
         Some("noul") => Ok(percentage()),
         Some("score") => {
@@ -62,9 +62,9 @@ fn answer_schema(qid: &str, question: &Value) -> Result<Value, JevError> {
             Ok(strict_object(props([("confidence", percentage()), ("probabilities", probabilities)])))
         }
         Some(other) => {
-            Err(JevError::Api(format!("question `{qid}` has unsupported type `{other}`; this backend answers `noul` and `score`")))
+            Err(DecisionError::Api(format!("question `{qid}` has unsupported type `{other}`; this backend answers `noul` and `score`")))
         }
-        None => Err(JevError::Api(format!("question `{qid}` has no `type`"))),
+        None => Err(DecisionError::Api(format!("question `{qid}` has no `type`"))),
     }
 }
 
@@ -75,7 +75,7 @@ pub(crate) fn wire_id(index: usize) -> String {
 }
 
 /// The whole response schema: `{"answers": {<wire id>: <answer>, ...}}`.
-pub(crate) fn request_schema(questions: &Map<String, Value>) -> Result<Value, JevError> {
+pub(crate) fn request_schema(questions: &Map<String, Value>) -> Result<Value, DecisionError> {
     let mut answers = Map::new();
     for (index, (qid, question)) in questions.iter().enumerate() {
         answers.insert(wire_id(index), answer_schema(qid, question)?);
@@ -84,17 +84,17 @@ pub(crate) fn request_schema(questions: &Map<String, Value>) -> Result<Value, Je
 }
 
 /// `request_schema`, refused when it is larger than a strict-mode endpoint accepts.
-pub(crate) fn budgeted_schema(questions: &Map<String, Value>) -> Result<Value, JevError> {
+pub(crate) fn budgeted_schema(questions: &Map<String, Value>) -> Result<Value, DecisionError> {
     let schema = request_schema(questions)?;
     let (declared, chars) = schema_budget(&schema);
     if declared > MAX_SCHEMA_PROPERTIES {
-        return Err(JevError::TokenLimit(format!(
+        return Err(DecisionError::TokenLimit(format!(
             "{} questions need {declared} schema properties, over the {MAX_SCHEMA_PROPERTIES} limit; ask fewer questions per request",
             questions.len()
         )));
     }
     if chars > MAX_SCHEMA_STRING_CHARS {
-        return Err(JevError::TokenLimit(format!(
+        return Err(DecisionError::TokenLimit(format!(
             "response schema needs {chars} string characters, over the {MAX_SCHEMA_STRING_CHARS} limit; ask fewer questions per request"
         )));
     }
@@ -103,7 +103,7 @@ pub(crate) fn budgeted_schema(questions: &Map<String, Value>) -> Result<Value, J
 
 /// Rejects a question map this wire format cannot carry, before anything is sent. For backends
 /// that send no schema; `request_schema` makes the same checks.
-pub(crate) fn check_questions(questions: &Map<String, Value>) -> Result<(), JevError> {
+pub(crate) fn check_questions(questions: &Map<String, Value>) -> Result<(), DecisionError> {
     questions.iter().try_for_each(|(qid, question)| answer_schema(qid, question).map(drop))
 }
 
@@ -145,8 +145,8 @@ fn sample(ids: &[&String]) -> String {
 ///
 /// Every diagnostic here is built from the question the caller asked, never from what came back.
 /// A wrong answer can contain the user's own source, or anything else the model chose to emit.
-fn decode_answer(qid: &str, question: &Value, answer: &Value) -> Result<Value, JevError> {
-    let wrong = |what: String| Err(JevError::Api(format!("answer for `{qid}` {what}")));
+fn decode_answer(qid: &str, question: &Value, answer: &Value) -> Result<Value, DecisionError> {
+    let wrong = |what: String| Err(DecisionError::Api(format!("answer for `{qid}` {what}")));
     match question.get("type").and_then(Value::as_str).unwrap_or_default() {
         "noul" => match probability(Some(answer)) {
             Some(p) => return Ok(json!({"type": "noul", "noul": p})),
@@ -196,11 +196,11 @@ fn decode_answer(qid: &str, question: &Value, answer: &Value) -> Result<Value, J
 ///
 /// Unanswered ids are named, because they come from the caller's own question map. Unexpected ids
 /// are only counted: those strings came from the model.
-pub(crate) fn decode_answers(questions: &Map<String, Value>, answers: &Map<String, Value>) -> Result<Map<String, Value>, JevError> {
+pub(crate) fn decode_answers(questions: &Map<String, Value>, answers: &Map<String, Value>) -> Result<Map<String, Value>, DecisionError> {
     let missing: Vec<&String> =
         questions.keys().enumerate().filter(|(index, _)| !answers.contains_key(&wire_id(*index))).map(|(_, qid)| qid).collect();
     if !missing.is_empty() {
-        return Err(JevError::Api(format!(
+        return Err(DecisionError::Api(format!(
             "model left {} of {} questions unanswered: {}",
             missing.len(),
             questions.len(),
@@ -210,7 +210,7 @@ pub(crate) fn decode_answers(questions: &Map<String, Value>, answers: &Map<Strin
     // Every wire id is present, so anything beyond that count was not asked.
     let extra = answers.len() - questions.len();
     if extra > 0 {
-        return Err(JevError::Api(format!("model returned {extra} answer(s) to questions that were not asked")));
+        return Err(DecisionError::Api(format!("model returned {extra} answer(s) to questions that were not asked")));
     }
     questions
         .iter()
@@ -346,7 +346,7 @@ mod tests {
     fn budgeted_schema_refuses_more_properties_than_the_endpoint_allows() {
         let questions: Map<String, Value> = (0..5000).map(|i| (format!("q{i}"), noul_q())).collect();
         match budgeted_schema(&questions) {
-            Err(JevError::TokenLimit(message)) => {
+            Err(DecisionError::TokenLimit(message)) => {
                 assert!(message.contains("5000") && message.contains("fewer questions"), "{message}");
             }
             other => panic!("{other:?}"),

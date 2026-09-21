@@ -56,8 +56,8 @@ against a local fake only.
 `src/chatgpt.rs`: positional wire ids, the strict response schema with its strict-mode size
 budget (`budgeted_schema`), and `decode_answers`, which checks a reply against the questions asked
 and rebuilds Jev's `noul` / `score` shape. `check_questions` runs the schema's question checks for
-a request that sends no schema. URL vetting lives in `client.rs`: `validate_bearer_url` (https, or
-http on loopback) when a key is sent, `validate_keyless_url` when none is. ChatGPT requests and
+a request that sends no schema. URL vetting lives in `client.rs` (`backend.rs` since ADR 0009): `validate_bearer_url` (https,
+or http on loopback) when a key is sent, `validate_keyless_url` when none is. ChatGPT requests and
 behaviour are unchanged.
 
 ### Configuration

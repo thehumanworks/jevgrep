@@ -12,17 +12,18 @@ use std::io::{self, IsTerminal, Write};
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::backend::DecisionBackend;
+use crate::backend::{DecisionBackend, DecisionError};
 use crate::chatgpt::{ChatGptClient, ChatGptConfig};
 use crate::chatgpt_auth::{device_login, resolve_credentials};
-use crate::client::{resolve_api_key, Config, JevClient, JevError};
 use crate::files::{discover, Discover};
 use crate::filters::{parse_filter, Rules};
+use crate::jev::resolve_api_key;
 use crate::openai::{evaluation_url, label, resolve_key, OpenAiClient, OpenAiConfig, OPENAI_KEY_VAR};
 use crate::results::{filtered_out, select, select_files, Limits};
 use crate::search::{search, Options};
 use progress::Progress;
 use render::{plural, render_files_styled, render_text_styled, ColorEnv, Palette};
+use typesafe_jev::{Client as JevClient, Config};
 
 fn thousands(n: u64) -> String {
     let digits = n.to_string();
@@ -146,7 +147,7 @@ fn execute(args: &Args, out: &mut dyn Write) -> io::Result<i32> {
     progress.finish_and_clear();
     let (ranked, client) = match searched {
         Ok(done) => done,
-        Err(e @ JevError::Auth(_)) => {
+        Err(e @ DecisionError::Auth(_)) => {
             eprintln!("jg: {}", diagnostics.notice(e));
             return Ok(2);
         }
@@ -242,15 +243,23 @@ fn execute(args: &Args, out: &mut dyn Write) -> io::Result<i32> {
     Ok(if any { 0 } else { 1 })
 }
 
-fn build_backend(args: &Args, progress: &Arc<Progress>) -> Result<Box<dyn DecisionBackend>, JevError> {
+/// The `User-Agent` the Jev client keeps sending; the other backends build the same string themselves.
+const USER_AGENT: &str = concat!("jg/", env!("CARGO_PKG_VERSION"));
+
+fn build_backend(args: &Args, progress: &Arc<Progress>) -> Result<Box<dyn DecisionBackend>, DecisionError> {
     let debug_progress = Arc::clone(progress);
     let reporter = move |msg: &str| debug_progress.suspend(|| eprintln!("jg[debug]: {msg}"));
     let debug = std::env::var_os("JG_DEBUG").is_some();
     match args.backend {
         BackendKind::Jev => {
             let key = resolve_api_key()?;
-            let cfg =
-                Config { base_url: args.base_url.clone(), model: args.model.clone(), pool_size: args.jobs.max(8), ..Config::default() };
+            let cfg = Config {
+                base_url: args.base_url.clone(),
+                model: args.model.clone(),
+                pool_size: args.jobs.max(8),
+                user_agent: USER_AGENT.into(),
+                ..Config::default()
+            };
             let mut client = JevClient::new(&key, cfg);
             if debug {
                 client.set_debug_reporter(reporter);
@@ -270,7 +279,8 @@ fn build_backend(args: &Args, progress: &Arc<Progress>) -> Result<Box<dyn Decisi
             let key = resolve_key(&args.base_url, args.api_key.as_ref().map(|key| key.0.as_str()), |name| std::env::var(name).ok())?;
             // Jev behind a gateway is still Jev: same questions, same answers, same client.
             if let Some(url) = evaluation_url(&args.base_url, &args.model) {
-                let key = key.ok_or_else(|| JevError::Auth(format!("{OPENAI_KEY_VAR} is not set. Export it, or pass --api-key <KEY>.")))?;
+                let key =
+                    key.ok_or_else(|| DecisionError::Auth(format!("{OPENAI_KEY_VAR} is not set. Export it, or pass --api-key <KEY>.")))?;
                 let cfg = Config {
                     base_url: url.to_owned(),
                     model: args.model.clone(),
@@ -282,6 +292,7 @@ fn build_backend(args: &Args, progress: &Arc<Progress>) -> Result<Box<dyn Decisi
                     max_retries: 16,
                     max_backoff: 2.0,
                     pool_size: args.jobs.max(8),
+                    user_agent: USER_AGENT.into(),
                     ..Config::default()
                 };
                 let mut client = JevClient::new(&key, cfg);

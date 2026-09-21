@@ -34,7 +34,8 @@ Introduce `crate::backend::DecisionBackend: Send + Sync` with:
 `DecisionError` is `JevError`. Search and path triage take `&dyn DecisionBackend`. They do not
 discover files or render results. `JevClient` and `ChatGptClient` both implement the trait.
 `Usage::add` and `Usage::add_retry` are crate-visible so either client can record tokens and
-retries. An unsplittable `TokenLimit` on a single-line chunk is returned as an error instead of
+retries (since ADR 0009 they are the `typesafe-jev` crate's public `Usage::record` and
+`Usage::record_retry`, and `DecisionError` is that crate's `Error`). An unsplittable `TokenLimit` on a single-line chunk is returned as an error instead of
 being dropped.
 
 ### CLI

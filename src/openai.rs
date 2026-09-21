@@ -26,7 +26,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde_json::{json, Map, Value};
 
 use crate::answers::{budgeted_schema, check_questions, decode_answers, wire_id};
-use crate::client::{jitter, validate_bearer_url, validate_keyless_url, AdaptiveLimiter, JevError, Reply, Usage};
+use crate::backend::{jitter, validate_bearer_url, validate_keyless_url, DecisionError};
+use typesafe_jev::{AdaptiveLimiter, Reply, Usage};
 
 /// The API root, as OpenAI's SDKs take it: without `/responses` or `/chat/completions`.
 pub const DEFAULT_OPENAI_URL: &str = "https://api.openai.com/v1";
@@ -136,17 +137,17 @@ pub fn evaluation_url(base_url: &str, model: &str) -> Option<&'static str> {
 /// The key to send, if any: `--api-key`, else `OPENAI_API_KEY`. Nothing else is consulted; in
 /// particular no secret manager is ever launched to find one. `Ok(None)` is a base URL other than
 /// OpenAI's with no key set: local servers have none, and one that wants a key will say so.
-pub fn resolve_key(base_url: &str, flag: Option<&str>, env: impl Fn(&str) -> Option<String>) -> Result<Option<String>, JevError> {
+pub fn resolve_key(base_url: &str, flag: Option<&str>, env: impl Fn(&str) -> Option<String>) -> Result<Option<String>, DecisionError> {
     if let Some(key) = flag {
         return match key.trim() {
-            "" => Err(JevError::Auth("--api-key is empty".into())),
+            "" => Err(DecisionError::Auth("--api-key is empty".into())),
             key => Ok(Some(key.to_owned())),
         };
     }
     match env(OPENAI_KEY_VAR).map(|key| key.trim().to_owned()).filter(|key| !key.is_empty()) {
         Some(key) => Ok(Some(key)),
         None if !is_openai(base_url) => Ok(None),
-        None => Err(JevError::Auth(format!("{OPENAI_KEY_VAR} is not set. Export it, or pass --api-key <KEY>."))),
+        None => Err(DecisionError::Auth(format!("{OPENAI_KEY_VAR} is not set. Export it, or pass --api-key <KEY>."))),
     }
 }
 
@@ -229,7 +230,7 @@ enum Failure {
     Unusable(String),
     /// Worth asking again at once, differently. `String` is what the service said.
     Adapt(Adaptation, String),
-    Fatal(JevError),
+    Fatal(DecisionError),
 }
 
 fn retry(message: impl Into<String>) -> Failure {
@@ -237,7 +238,7 @@ fn retry(message: impl Into<String>) -> Failure {
 }
 
 fn fatal(message: &str) -> Failure {
-    Failure::Fatal(JevError::Api(message.to_owned()))
+    Failure::Fatal(DecisionError::Api(message.to_owned()))
 }
 
 /// Seconds from now until a rate-limit reset given as an instant in epoch milliseconds. Services
@@ -460,14 +461,14 @@ impl OpenAiClient {
 
     /// The request for `questions` in the shape `sent` describes. Only the common core of each API
     /// goes out, since a strict service refuses fields it does not know; the rest is `extra_body`.
-    fn request_body(&self, state: &Value, questions: &Map<String, Value>, sent: Sent, temperature: f64) -> Result<Vec<u8>, JevError> {
+    fn request_body(&self, state: &Value, questions: &Map<String, Value>, sent: Sent, temperature: f64) -> Result<Vec<u8>, DecisionError> {
         let schema = match sent.schema {
             true => Some(budgeted_schema(questions)?),
             false => check_questions(questions).map(|()| None)?,
         };
         let asked: Map<String, Value> =
             questions.values().enumerate().map(|(index, question)| (wire_id(index), question.clone())).collect();
-        let text = serde_json::to_string(&json!({"state": state, "questions": asked})).map_err(|e| JevError::Api(e.to_string()))?;
+        let text = serde_json::to_string(&json!({"state": state, "questions": asked})).map_err(|e| DecisionError::Api(e.to_string()))?;
         let mut body = Map::new();
         body.insert("model".into(), json!(self.model));
         match sent.api {
@@ -502,7 +503,7 @@ impl OpenAiClient {
                 value => drop(body.insert(field.clone(), value.clone())),
             }
         }
-        serde_json::to_vec(&body).map_err(|e| JevError::Api(e.to_string()))
+        serde_json::to_vec(&body).map_err(|e| DecisionError::Api(e.to_string()))
     }
 
     /// Server or transport text made fit for one line of stderr: the key removed, control
@@ -546,7 +547,7 @@ impl OpenAiClient {
                 .to_lowercase();
         let mentions = |needles: &[&str]| needles.iter().any(|needle| probe.contains(needle));
         if status == 401 {
-            return Failure::Fatal(JevError::Auth(match self.secret {
+            return Failure::Fatal(DecisionError::Auth(match self.secret {
                 Some(_) => format!("{} rejected the API key ({said}). Check {OPENAI_KEY_VAR} or --api-key.", self.label),
                 None => {
                     format!("{} wants an API key ({said}) and none was sent. Set {OPENAI_KEY_VAR} or pass --api-key <KEY>.", self.label)
@@ -558,7 +559,7 @@ impl OpenAiClient {
             return Failure::Adapt(Adaptation::ChatCompletions, said);
         }
         if status == 413 || mentions(&["context length", "context_length", "maximum context", "too many tokens"]) {
-            return Failure::Fatal(JevError::TokenLimit(said));
+            return Failure::Fatal(DecisionError::TokenLimit(said));
         }
         if matches!(status, 400 | 422)
             && sent.schema
@@ -571,21 +572,21 @@ impl OpenAiClient {
         }
         // A spent daily allowance or an empty account does not come back by waiting a few seconds.
         if status == 429 && mentions(&["per-day", "insufficient_quota", "current quota"]) {
-            return Failure::Fatal(JevError::Api(said));
+            return Failure::Fatal(DecisionError::Api(said));
         }
         if RETRYABLE.contains(&status) {
             let reset =
                 field(field(metadata.as_ref(), "headers").as_ref(), "X-RateLimit-Reset").and_then(|v| seconds_until(&text(Some(v))));
             return Failure::Retry { message: said, throttled: status == 429 || status == 529, wait: retry_after.or(reset) };
         }
-        Failure::Fatal(JevError::Api(said))
+        Failure::Fatal(DecisionError::Api(said))
     }
 
     /// The model's output text from a 200 body of either API, or why there is none.
     fn output_text(&self, parsed: &Value, sent: Sent) -> Result<String, Failure> {
         let refused = || fatal("model refused to answer the questions");
         let out_of_budget =
-            || Failure::Fatal(JevError::TokenLimit("model ran out of output budget; ask fewer questions per request".into()));
+            || Failure::Fatal(DecisionError::TokenLimit("model ran out of output budget; ask fewer questions per request".into()));
         if sent.api == Api::ChatCompletions {
             let choice = parsed.get("choices").and_then(|c| c.get(0)).ok_or_else(|| retry("response carried no choices"))?;
             if let Some(error) = choice.get("error").filter(|error| !error.is_null()) {
@@ -636,7 +637,7 @@ impl OpenAiClient {
         // The two APIs name the same counts differently.
         let usage = parsed.get("usage");
         let count = |names: [&str; 2]| names.iter().find_map(|k| usage.and_then(|u| u.get(k)).and_then(Value::as_u64)).unwrap_or(0);
-        self.usage.add_counts(count(["input_tokens", "prompt_tokens"]), count(["output_tokens", "completion_tokens"]));
+        self.usage.record(count(["input_tokens", "prompt_tokens"]), count(["output_tokens", "completion_tokens"]));
         if let Some(cost) = usage.and_then(|u| u.get("cost")).and_then(Value::as_f64).filter(|c| c.is_finite() && *c >= 0.0) {
             self.cost_nanos.fetch_add((cost * 1e9).round() as u64, Ordering::Relaxed);
             self.cost_reported.store(true, Ordering::Relaxed);
@@ -656,9 +657,9 @@ impl OpenAiClient {
     /// The `answers` map for `questions`, judged against `state`. Adapts to what the service
     /// cannot do, retries transient failures with backoff and resamples unusable replies. Every
     /// question is answered or the whole call fails.
-    pub fn ask(&self, state: &Value, questions: &Map<String, Value>) -> Result<Map<String, Value>, JevError> {
+    pub fn ask(&self, state: &Value, questions: &Map<String, Value>) -> Result<Map<String, Value>, DecisionError> {
         if let Some(problem) = &self.config_error {
-            return Err(JevError::Api(problem.clone()));
+            return Err(DecisionError::Api(problem.clone()));
         }
         // Nothing to ask is not worth a round trip.
         if questions.is_empty() {
@@ -700,23 +701,23 @@ impl OpenAiClient {
                     if !learnt.swap(true, Ordering::Relaxed) {
                         self.debug(&format!("{now} ({said})"));
                     }
-                    self.usage.add_retry();
+                    self.usage.record_retry();
                 }
                 Err(Failure::Unusable(message)) => {
                     self.debug(&format!("reply {}: {message}", resamples + 1));
                     if resamples == MAX_RESAMPLES {
-                        return Err(JevError::Api(format!("model gave an unusable reply {} times: {message}", resamples + 1)));
+                        return Err(DecisionError::Api(format!("model gave an unusable reply {} times: {message}", resamples + 1)));
                     }
                     resamples += 1;
-                    self.usage.add_retry();
+                    self.usage.record_retry();
                 }
                 Err(Failure::Retry { message, wait, .. }) => {
                     self.debug(&format!("attempt {}: {message} wait={wait:?}s", failures + 1));
                     if failures == self.max_retries {
-                        return Err(JevError::Api(format!("gave up after {} retries: {message}", self.max_retries)));
+                        return Err(DecisionError::Api(format!("gave up after {} retries: {message}", self.max_retries)));
                     }
                     failures += 1;
-                    self.usage.add_retry();
+                    self.usage.record_retry();
                     self.sleep(wait.unwrap_or(0.0) + (0.5 * 2f64.powi(failures as i32 - 1)).min(30.0) * (0.5 + jitter()));
                 }
             }
@@ -819,7 +820,7 @@ mod tests {
         (c, calls)
     }
 
-    fn ask_err(replies: Vec<Result<Reply, String>>) -> (JevError, usize) {
+    fn ask_err(replies: Vec<Result<Reply, String>>) -> (DecisionError, usize) {
         let (c, calls) = scripted(replies);
         let err = c.ask(&json!({}), &questions()).unwrap_err();
         (err, calls.load(Ordering::Relaxed))
@@ -886,12 +887,12 @@ mod tests {
         assert_eq!(resolve_key(ELSEWHERE, None, env(Some("sk-env"))).unwrap().as_deref(), Some("sk-env"));
         assert_eq!(resolve_key(ELSEWHERE, Some(" sk-flag "), |_| panic!("the flag settles it")).unwrap().as_deref(), Some("sk-flag"));
         assert!(
-            matches!(resolve_key(ELSEWHERE, Some(" "), env(Some("sk-env"))), Err(JevError::Auth(m)) if m.contains("--api-key is empty"))
+            matches!(resolve_key(ELSEWHERE, Some(" "), env(Some("sk-env"))), Err(DecisionError::Auth(m)) if m.contains("--api-key is empty"))
         );
         for missing in [None, Some(""), Some("  ")] {
             assert_eq!(resolve_key("http://localhost:11434/v1", None, env(missing)).unwrap(), None);
             assert_eq!(resolve_key(ELSEWHERE, None, env(missing)).unwrap(), None);
-            let JevError::Auth(message) = resolve_key("https://api.openai.com/v1/", None, env(missing)).unwrap_err() else { panic!() };
+            let DecisionError::Auth(message) = resolve_key("https://api.openai.com/v1/", None, env(missing)).unwrap_err() else { panic!() };
             assert!(message.contains("OPENAI_API_KEY") && message.contains("--api-key") && !message.contains("fnox"), "{message}");
         }
         // No other service's variable is borrowed.
@@ -925,7 +926,7 @@ mod tests {
         // A schema too large for strict mode asks the caller to split, before anything is sent.
         let many: Map<String, Value> = (0..5000).map(|i| (format!("q{i}"), json!({"type": "noul", "instructions": "?"}))).collect();
         let c = client(|_, _| panic!("must not reach the wire"));
-        assert!(matches!(c.ask(&json!({}), &many), Err(JevError::TokenLimit(m)) if m.contains("fewer questions")));
+        assert!(matches!(c.ask(&json!({}), &many), Err(DecisionError::TokenLimit(m)) if m.contains("fewer questions")));
     }
 
     #[test]
@@ -1004,10 +1005,10 @@ mod tests {
     fn a_refusal_of_something_that_was_not_sent_is_just_an_error() {
         // A URL that settles on Responses has nowhere to fall back to.
         let c = client_with(config("https://llm.example/v1/responses"), |_, _| reply(404, error_body(404, "Not Found")));
-        assert!(matches!(c.ask(&json!({}), &questions()), Err(JevError::Api(m)) if m == "HTTP 404: Not Found"));
+        assert!(matches!(c.ask(&json!({}), &questions()), Err(DecisionError::Api(m)) if m == "HTTP 404: Not Found"));
         // Nor does an unknown model become a different API's problem for long: both say so.
         let (err, calls) = ask_err(vec![reply(404, error_body(404, "The model `nope` does not exist"))]);
-        assert!(matches!(&err, JevError::Api(m) if m.contains("does not exist")), "{err:?}");
+        assert!(matches!(&err, DecisionError::Api(m) if m.contains("does not exist")), "{err:?}");
         assert_eq!(calls, 2);
         // With no schema and no temperature left to drop, the same words are a plain failure.
         let cfg =
@@ -1018,7 +1019,7 @@ mod tests {
             counter.fetch_add(1, Ordering::Relaxed);
             reply(400, error_body(400, "json_schema and temperature are not supported"))
         });
-        assert!(matches!(c.ask(&json!({}), &questions()), Err(JevError::Api(m)) if m.starts_with("HTTP 400")));
+        assert!(matches!(c.ask(&json!({}), &questions()), Err(DecisionError::Api(m)) if m.starts_with("HTTP 400")));
         assert_eq!(calls.load(Ordering::Relaxed), 2, "one for the temperature jg thought it sent, then the verdict");
     }
 
@@ -1045,14 +1046,14 @@ mod tests {
             let mut extra = Map::new();
             extra.insert((*field).to_owned(), json!(true));
             let c = client_with(OpenAiConfig { extra_body: extra, ..config(ELSEWHERE) }, |_, _| panic!("must not reach the wire"));
-            assert!(matches!(c.ask(&json!({}), &questions()), Err(JevError::Api(m)) if m.contains(field)));
+            assert!(matches!(c.ask(&json!({}), &questions()), Err(DecisionError::Api(m)) if m.contains(field)));
         }
     }
 
     #[test]
     fn a_missing_model_fails_the_first_ask() {
         let c = client_with(OpenAiConfig::default(), |_, _| panic!("must not reach the wire"));
-        assert!(matches!(c.ask(&json!({}), &questions()), Err(JevError::Api(m)) if m.contains("no model is set")));
+        assert!(matches!(c.ask(&json!({}), &questions()), Err(DecisionError::Api(m)) if m.contains("no model is set")));
     }
 
     #[test]
@@ -1089,7 +1090,7 @@ mod tests {
         assert!(c.ask(&json!({}), &Map::new()).unwrap().is_empty());
         let mut qs = Map::new();
         qs.insert("q".into(), json!({"type": "freeform", "instructions": "Summarise."}));
-        assert!(matches!(c.ask(&json!({}), &qs), Err(JevError::Api(m)) if m.contains("unsupported type `freeform`")));
+        assert!(matches!(c.ask(&json!({}), &qs), Err(DecisionError::Api(m)) if m.contains("unsupported type `freeform`")));
         assert_eq!(c.usage.requests(), 0);
     }
 
@@ -1122,7 +1123,7 @@ mod tests {
         ];
         for (content, expected) in cases {
             let (err, calls) = ask_err(vec![reply(200, response(&content))]);
-            let JevError::Api(message) = &err else { panic!("{err:?}") };
+            let DecisionError::Api(message) = &err else { panic!("{err:?}") };
             assert!(message.contains("unusable reply 3 times") && message.contains(expected), "{message}");
             assert_eq!(calls, 3);
         }
@@ -1132,14 +1133,14 @@ mod tests {
     fn truncation_asks_the_caller_to_split_and_filters_and_refusals_are_final() {
         let incomplete = |reason: &str| json!({"status": "incomplete", "incomplete_details": {"reason": reason}, "output": []}).to_string();
         let (err, calls) = ask_err(vec![reply(200, incomplete("max_output_tokens"))]);
-        assert!(matches!(&err, JevError::TokenLimit(m) if m.contains("fewer questions")), "{err:?}");
+        assert!(matches!(&err, DecisionError::TokenLimit(m) if m.contains("fewer questions")), "{err:?}");
         assert_eq!(calls, 1);
         let (err, calls) = ask_err(vec![reply(200, incomplete("content_filter"))]);
-        assert!(matches!(&err, JevError::Api(m) if m.contains("content filter")), "{err:?}");
+        assert!(matches!(&err, DecisionError::Api(m) if m.contains("content filter")), "{err:?}");
         assert_eq!(calls, 1);
         let refusal = json!({"status": "completed", "output": [{"type": "message", "content": [{"type": "refusal", "refusal": "I would rather not."}]}]});
         let (err, calls) = ask_err(vec![reply(200, refusal.to_string())]);
-        assert!(matches!(&err, JevError::Api(m) if m.contains("refused") && !m.contains("rather not")), "{err:?}");
+        assert!(matches!(&err, DecisionError::Api(m) if m.contains("refused") && !m.contains("rather not")), "{err:?}");
         assert_eq!(calls, 1);
 
         let chat = config("https://llm.example/v1/chat/completions");
@@ -1147,7 +1148,7 @@ mod tests {
         let cut = finished("length", json!({"content": "{\"answers\":{\"0\":9"}));
         assert!(matches!(
             client_with(chat, move |_, _| reply(200, cut.clone())).ask(&json!({}), &questions()),
-            Err(JevError::TokenLimit(_))
+            Err(DecisionError::TokenLimit(_))
         ));
     }
 
@@ -1155,12 +1156,12 @@ mod tests {
     fn a_rejected_or_wanted_key_is_final_and_actionable() {
         let mut c = client(|_, _| reply(401, error_body(401, "No auth credentials found")));
         c.secret = Some("sk-test".into());
-        let JevError::Auth(message) = c.ask(&json!({}), &questions()).unwrap_err() else { panic!() };
+        let DecisionError::Auth(message) = c.ask(&json!({}), &questions()).unwrap_err() else { panic!() };
         assert_eq!(message, "llm.example rejected the API key (HTTP 401: No auth credentials found). Check OPENAI_API_KEY or --api-key.");
         assert_eq!(c.usage.retries(), 0);
         // A keyless request to a server that turns out to want a key says that, not "rejected".
         let c = client(|_, _| reply(401, "Unauthorized".into()));
-        let JevError::Auth(message) = c.ask(&json!({}), &questions()).unwrap_err() else { panic!() };
+        let DecisionError::Auth(message) = c.ask(&json!({}), &questions()).unwrap_err() else { panic!() };
         assert_eq!(message, "llm.example wants an API key (HTTP 401) and none was sent. Set OPENAI_API_KEY or pass --api-key <KEY>.");
     }
 
@@ -1183,7 +1184,7 @@ mod tests {
             json!({"error": {"message": "You exceeded your current quota.", "type": "insufficient_quota", "code": "insufficient_quota"}});
         for spent in [error_body(429, "Rate limit exceeded: free-models-per-day"), openai.to_string()] {
             let (err, calls) = ask_err(vec![reply(429, spent)]);
-            assert!(matches!(&err, JevError::Api(m) if m.starts_with("HTTP 429: ")), "{err:?}");
+            assert!(matches!(&err, DecisionError::Api(m) if m.starts_with("HTTP 429: ")), "{err:?}");
             assert_eq!(calls, 1);
         }
     }
@@ -1200,7 +1201,7 @@ mod tests {
         c.ask(&json!({}), &questions()).unwrap();
         assert_eq!((calls.load(Ordering::Relaxed), c.usage.retries()), (4, 3));
         let (err, calls) = ask_err(vec![Err("connection reset".into())]);
-        assert!(matches!(&err, JevError::Api(m) if m.contains("gave up after 8 retries: connection reset")), "{err:?}");
+        assert!(matches!(&err, DecisionError::Api(m) if m.contains("gave up after 8 retries: connection reset")), "{err:?}");
         assert_eq!(calls, 9);
     }
 
@@ -1211,11 +1212,11 @@ mod tests {
             .to_string();
         for (status, body) in [(400, error_body(400, long)), (400, coded), (413, "too large".to_owned())] {
             let (err, calls) = ask_err(vec![reply(status, body)]);
-            assert!(matches!(err, JevError::TokenLimit(_)), "{err:?}");
+            assert!(matches!(err, DecisionError::TokenLimit(_)), "{err:?}");
             assert_eq!(calls, 1);
         }
         let (err, calls) = ask_err(vec![reply(402, error_body(402, "Insufficient credits"))]);
-        assert!(matches!(&err, JevError::Api(m) if m == "HTTP 402: Insufficient credits"), "{err:?}");
+        assert!(matches!(&err, DecisionError::Api(m) if m == "HTTP 402: Insufficient credits"), "{err:?}");
         assert_eq!(calls, 1);
     }
 
@@ -1227,7 +1228,7 @@ mod tests {
             reply(403, json!({"error": error}).to_string())
         });
         c.secret = Some("sk-SECRET".into());
-        let JevError::Api(message) = c.ask(&json!({}), &questions()).unwrap_err() else { panic!() };
+        let DecisionError::Api(message) = c.ask(&json!({}), &questions()).unwrap_err() else { panic!() };
         assert!(
             message.starts_with("HTTP 403: Provider returned error (Novita: upstream exploded Authorization: Bearer <redacted>"),
             "{message}"
@@ -1259,6 +1260,6 @@ mod tests {
         assert!(problem(None, "http://llm.lan:8000/v1").is_none());
         assert!(problem(Some("k"), "http://localhost:8000/v1").is_none());
         assert!(problem(None, "ftp://llm.lan/v1").unwrap().contains("cannot use the configured base URL"));
-        assert!(matches!(ask(None, "ftp://llm.lan/v1"), Err(JevError::Api(m)) if m.contains("cannot use")));
+        assert!(matches!(ask(None, "ftp://llm.lan/v1"), Err(DecisionError::Api(m)) if m.contains("cannot use")));
     }
 }

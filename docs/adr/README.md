@@ -12,9 +12,10 @@ Decisions describe the implemented contract, not a release announcement.
 | [0006](0006-clippy-correctness.md) | Accepted | Correctness-first Clippy: deny correctness/suspicious, cherry-pick bug-catching pedantic/restriction lints, keep `-D warnings` in every gate |
 | [0007](0007-tests-as-specification.md) | Accepted | Requirements are table-driven and property-style tests on real invariants, not comments-only |
 | [0008](0008-pre-commit-hook.md) | Accepted | Installable pre-commit hook runs fmt, Clippy, and tests; CI still runs isolated `scripts/check.sh` |
+| [0009](0009-jev-client-crate.md) | Accepted | The Jev client is the independent `typesafe-jev` crate in a workspace; `jg` keeps key lookup, the other backends and their shared helpers |
 
 ADRs 0001–0003 are dated September 18, 2026; 0004 and 0005 are dated September 19, 2026;
-0006–0008 are dated September 20, 2026. The implementation plan is
+0006–0008 are dated September 20, 2026; 0009 is dated September 21, 2026. The implementation plan is
 [CLI modernization](../plans/cli-modernization.md). Test and validation commands
 are in the [development guide](../../README.md#development).
 

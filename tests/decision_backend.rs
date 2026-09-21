@@ -1,8 +1,7 @@
 //! Search consumes the decision contract without depending on a provider client.
 mod common;
 
-use jevgrep::backend::{DecisionBackend, DecisionError};
-use jevgrep::client::Usage;
+use jevgrep::backend::{DecisionBackend, DecisionError, Usage};
 use jevgrep::search::{search, Options};
 use serde_json::{json, Map, Value};
 

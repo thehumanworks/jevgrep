@@ -51,5 +51,11 @@ again. Changes that do not alter the binary (docs, tests, CI, this file) need no
   only when asked.
 - `jg` never launches a secret manager for the `openai` backend's key, and no backend is added
   per service: an OpenAI-compatible service is a base URL, a key and a model (ADR 0005).
+- The Jev HTTP client is the `typesafe-jev` crate in `crates/typesafe-jev`, a workspace member
+  with its own README, tests and version (ADR 0009). It must stay free of `jg` policy: no `fnox`,
+  no `JG_*` variables, no `jg` in messages. Root `cargo test` / `clippy` / `doc` cover it.
+  `scripts/release.sh` releases `jg` only; publishing the crate is `cargo publish -p typesafe-jev`,
+  a separate act that the maintainer asks for by name. A change to the crate that alters what `jg`
+  sends or accepts on the wire is a `jg` change too and follows the release rules above.
 - Commit or push only when asked. Releases are the exception above: asking for one asks for its
   commit, tag and pushes.
