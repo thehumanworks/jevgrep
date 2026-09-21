@@ -5,8 +5,8 @@ use std::ffi::OsString;
 use clap::{error::ErrorKind, ColorChoice, Parser, ValueEnum};
 
 use crate::chatgpt::{CHATGPT_MODEL, DEFAULT_CHATGPT_URL};
-use crate::client::{DEFAULT_BASE_URL, DEFAULT_MODEL};
 use crate::openai::{DEFAULT_OPENAI_URL, OPENAI_URL_VAR, RESERVED_BODY_FIELDS};
+use typesafe_jev::{DEFAULT_BASE_URL, DEFAULT_MODEL};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
 pub enum BackendKind {

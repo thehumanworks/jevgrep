@@ -19,7 +19,7 @@ use std::process::{Command, Stdio};
 
 use serde_json::Value;
 
-use crate::client::JevError;
+use crate::backend::DecisionError;
 
 const ACCOUNT_ENV: &str = "CHATGPT_ACCOUNT_ID";
 const TOKEN_ENV: &str = "CHATGPT_ACCESS_TOKEN";
@@ -39,7 +39,7 @@ impl fmt::Debug for ChatGptCredentials {
 }
 
 /// Read subscription credentials without starting an interactive login.
-pub fn resolve_credentials() -> Result<ChatGptCredentials, JevError> {
+pub fn resolve_credentials() -> Result<ChatGptCredentials, DecisionError> {
     resolve_with(&|key| std::env::var_os(key), &|path| fs::read_to_string(path))
 }
 
@@ -50,7 +50,7 @@ pub fn resolve_credentials() -> Result<ChatGptCredentials, JevError> {
 /// The resulting cache is read directly: stale environment or TOML credentials
 /// cannot hide a successful login. Existing overrides still apply to subsequent
 /// calls to [`resolve_credentials`].
-pub fn device_login() -> Result<ChatGptCredentials, JevError> {
+pub fn device_login() -> Result<ChatGptCredentials, DecisionError> {
     device_login_with(&|key| std::env::var_os(key), &|path| fs::read_to_string(path), |codex_home| {
         login_command(codex_home).status().map(|status| status.success())
     })
@@ -70,7 +70,7 @@ fn login_command(codex_home: &Path) -> Command {
 fn resolve_with(
     env: &impl Fn(&str) -> Option<OsString>,
     read: &impl Fn(&Path) -> io::Result<String>,
-) -> Result<ChatGptCredentials, JevError> {
+) -> Result<ChatGptCredentials, DecisionError> {
     let account = env(ACCOUNT_ENV);
     let token = env(TOKEN_ENV);
     if account.is_some() || token.is_some() {
@@ -102,7 +102,7 @@ fn device_login_with(
     env: &impl Fn(&str) -> Option<OsString>,
     read: &impl Fn(&Path) -> io::Result<String>,
     run: impl FnOnce(&Path) -> io::Result<bool>,
-) -> Result<ChatGptCredentials, JevError> {
+) -> Result<ChatGptCredentials, DecisionError> {
     let path = credential_paths(env)
         .codex_json
         .ok_or_else(|| auth_error("Cannot locate the Codex cache. Set CODEX_HOME or HOME before device login."))?;
@@ -153,7 +153,7 @@ fn read_credentials(
     path: &Path,
     format: Format,
     read: &impl Fn(&Path) -> io::Result<String>,
-) -> Result<Option<ChatGptCredentials>, JevError> {
+) -> Result<Option<ChatGptCredentials>, DecisionError> {
     let contents = match read(path) {
         Ok(contents) => contents,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -172,7 +172,7 @@ fn read_credentials(
     parse_credentials(&value, format.source())
 }
 
-fn parse_credentials(value: &Value, source: &str) -> Result<Option<ChatGptCredentials>, JevError> {
+fn parse_credentials(value: &Value, source: &str) -> Result<Option<ChatGptCredentials>, DecisionError> {
     if !value.is_object() {
         return Err(auth_error(&format!("{source} must contain an object or table.")));
     }
@@ -196,7 +196,7 @@ fn parse_credentials(value: &Value, source: &str) -> Result<Option<ChatGptCreden
     Ok(None)
 }
 
-fn json_pair(value: &Value, account_key: &str, token_key: &str, source: &str) -> Result<Option<ChatGptCredentials>, JevError> {
+fn json_pair(value: &Value, account_key: &str, token_key: &str, source: &str) -> Result<Option<ChatGptCredentials>, DecisionError> {
     let account = value.get(account_key);
     let token = value.get(token_key);
     if account.is_none() && token.is_none() {
@@ -208,7 +208,7 @@ fn json_pair(value: &Value, account_key: &str, token_key: &str, source: &str) ->
     checked_pair(account.and_then(Value::as_str), token.and_then(Value::as_str), source).map(Some)
 }
 
-fn checked_pair(account: Option<&str>, token: Option<&str>, source: &str) -> Result<ChatGptCredentials, JevError> {
+fn checked_pair(account: Option<&str>, token: Option<&str>, source: &str) -> Result<ChatGptCredentials, DecisionError> {
     let (Some(account_id), Some(access_token)) = (account, token) else {
         return Err(auth_error(&format!(
             "Incomplete credentials in {source}; provide both account ID and access token in the same source."
@@ -226,8 +226,8 @@ fn checked_pair(account: Option<&str>, token: Option<&str>, source: &str) -> Res
     Ok(ChatGptCredentials { account_id: account_id.to_owned(), access_token: access_token.to_owned() })
 }
 
-fn auth_error(message: &str) -> JevError {
-    JevError::Auth(format!("{message} {LOGIN_HINT}"))
+fn auth_error(message: &str) -> DecisionError {
+    DecisionError::Auth(format!("{message} {LOGIN_HINT}"))
 }
 
 #[cfg(test)]

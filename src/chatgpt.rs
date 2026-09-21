@@ -9,14 +9,14 @@
 //! present, no extra ids, the right answer type, and numbers in range. A question that cannot be
 //! answered is an error, never a zero.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
 use serde_json::{json, Map, Value};
 
 use crate::answers::{budgeted_schema, decode_answers, wire_id};
-use crate::client::{validate_bearer_url, AdaptiveLimiter, JevError, Reply, Transport, Usage};
+use crate::backend::{jitter, validate_bearer_url, DecisionError};
+use typesafe_jev::{AdaptiveLimiter, Reply, Transport, Usage};
 
 pub const DEFAULT_CHATGPT_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 pub const CHATGPT_MODEL: &str = "gpt-5.6-luna";
@@ -88,21 +88,6 @@ Question types:
 Judge only what the state shows. Where the state is silent, answer near the base rate rather than
 guessing high or low.";
 
-/// Uniform in [0, 1), for retry jitter only.
-fn jitter() -> f64 {
-    static STATE: AtomicU64 = AtomicU64::new(0);
-    let mut x = STATE.load(Ordering::Relaxed);
-    if x == 0 {
-        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_nanos() as u64);
-        x = nanos ^ (u64::from(std::process::id()) << 32) | 1;
-    }
-    x ^= x << 13;
-    x ^= x >> 7;
-    x ^= x << 17;
-    STATE.store(x, Ordering::Relaxed);
-    (x >> 11) as f64 / (1u64 << 53) as f64
-}
-
 /// Bearer credentials must not travel over plaintext; see `validate_bearer_url`.
 fn validate_url(url: &str) -> Result<(), String> {
     validate_bearer_url("ChatGPT", url)
@@ -112,10 +97,10 @@ fn validate_url(url: &str) -> Result<(), String> {
 // Request
 // ---------------------------------------------------------------------------------------------
 
-fn request_body(state: &Value, questions: &Map<String, Value>) -> Result<Vec<u8>, JevError> {
+fn request_body(state: &Value, questions: &Map<String, Value>) -> Result<Vec<u8>, DecisionError> {
     let schema = budgeted_schema(questions)?;
     let asked: Map<String, Value> = questions.values().enumerate().map(|(index, question)| (wire_id(index), question.clone())).collect();
-    let text = serde_json::to_string(&json!({"state": state, "questions": asked})).map_err(|e| JevError::Api(e.to_string()))?;
+    let text = serde_json::to_string(&json!({"state": state, "questions": asked})).map_err(|e| DecisionError::Api(e.to_string()))?;
     let body = json!({
         "model": CHATGPT_MODEL,
         "instructions": INSTRUCTIONS,
@@ -126,7 +111,7 @@ fn request_body(state: &Value, questions: &Map<String, Value>) -> Result<Vec<u8>
         "reasoning": {"effort": REASONING_EFFORT},
         "text": {"format": {"type": "json_schema", "name": "jev_answers", "strict": true, "schema": schema}},
     });
-    serde_json::to_vec(&body).map_err(|e| JevError::Api(e.to_string()))
+    serde_json::to_vec(&body).map_err(|e| DecisionError::Api(e.to_string()))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -140,10 +125,10 @@ enum Failure {
         message: String,
         throttled: bool,
     },
-    Fatal(JevError),
+    Fatal(DecisionError),
 }
 
-fn fatal(error: JevError) -> Failure {
+fn fatal(error: DecisionError) -> Failure {
     Failure::Fatal(error)
 }
 
@@ -195,10 +180,10 @@ fn classify(context: &str, error: Option<&Value>) -> Failure {
     let said = format!("{context}: {shown}");
     if mentions_auth_failure(&probe) {
         // Credentials that expire mid-run look like this; retrying cannot help.
-        return fatal(JevError::Auth(format!("{said}. Sign in again with `jg --backend chatgpt --chatgpt-login <query>`.")));
+        return fatal(DecisionError::Auth(format!("{said}. Sign in again with `jg --backend chatgpt --chatgpt-login <query>`.")));
     }
     if mentions_context_limit(&probe) {
-        return fatal(JevError::TokenLimit(said));
+        return fatal(DecisionError::TokenLimit(said));
     }
     if mentions_rate_limit(&probe) {
         return Failure::Retry { message: said, throttled: true };
@@ -206,7 +191,7 @@ fn classify(context: &str, error: Option<&Value>) -> Failure {
     if ["server_error", "internal_error", "service_unavailable", "overloaded", "timeout"].contains(&shown.as_str()) {
         return Failure::Retry { message: said, throttled: false };
     }
-    fatal(JevError::Api(said))
+    fatal(DecisionError::Api(said))
 }
 
 /// Splits an SSE body into its `data:` payloads. Returns the parsed events and how many payloads
@@ -242,10 +227,10 @@ fn stopped_early(response: Option<&Value>) -> Failure {
     let reason = response.and_then(|r| r.get("incomplete_details")).and_then(|d| d.get("reason")).and_then(Value::as_str).unwrap_or("");
     match reason {
         "max_output_tokens" | "max_tokens" => {
-            fatal(JevError::TokenLimit("model ran out of output budget; ask fewer questions per request".into()))
+            fatal(DecisionError::TokenLimit("model ran out of output budget; ask fewer questions per request".into()))
         }
-        "content_filter" => fatal(JevError::Api("model run was stopped by a content filter".into())),
-        _ => fatal(JevError::Api("model run ended incomplete for an undisclosed reason".into())),
+        "content_filter" => fatal(DecisionError::Api("model run was stopped by a content filter".into())),
+        _ => fatal(DecisionError::Api("model run ended incomplete for an undisclosed reason".into())),
     }
 }
 
@@ -274,7 +259,7 @@ fn terminal_response(body: &str) -> Result<Settled, Failure> {
                 Err(classify("model run failed", parsed.get("error")))
             }
             None if parsed.get("status").and_then(Value::as_str) == Some("incomplete") => Err(stopped_early(Some(&parsed))),
-            None => Err(fatal(JevError::Api("JSON response did not report a completed run".into()))),
+            None => Err(fatal(DecisionError::Api("JSON response did not report a completed run".into()))),
         };
     }
     settle(&events, malformed)
@@ -288,7 +273,7 @@ fn settle(events: &[Value], malformed: usize) -> Result<Settled, Failure> {
         let response = event.get("response");
         match kind {
             "response.refusal.delta" | "response.refusal.done" => {
-                return Err(fatal(JevError::Api("model refused to answer the questions".into())));
+                return Err(fatal(DecisionError::Api("model refused to answer the questions".into())));
             }
             "response.output_text.delta" => deltas.push_str(event.get("delta").and_then(Value::as_str).unwrap_or_default()),
             "response.output_text.done" => done.push_str(event.get("text").and_then(Value::as_str).unwrap_or_default()),
@@ -298,13 +283,13 @@ fn settle(events: &[Value], malformed: usize) -> Result<Settled, Failure> {
                 }
             }
             "response.completed" => {
-                let response = response.ok_or_else(|| fatal(JevError::Api("response.completed carried no response".into())))?;
+                let response = response.ok_or_else(|| fatal(DecisionError::Api("response.completed carried no response".into())))?;
                 // A completed event that does not say "completed" is not one we should trust.
                 match response.get("status").and_then(Value::as_str) {
                     None | Some("completed") => {}
                     Some("incomplete") => return Err(stopped_early(Some(response))),
                     Some("failed") => return Err(classify("model run failed", response.get("error"))),
-                    Some(_) => return Err(fatal(JevError::Api("model run finished in an unexpected state".into()))),
+                    Some(_) => return Err(fatal(DecisionError::Api("model run finished in an unexpected state".into()))),
                 }
                 let streamed = [items, done, deltas].into_iter().find(|text| !text.trim().is_empty()).unwrap_or_default();
                 return Ok(Settled { response: response.clone(), streamed });
@@ -334,7 +319,7 @@ fn collect_text(items: &[Value], text: &mut String) -> Result<(), Failure> {
             match part.get("type").and_then(Value::as_str) {
                 Some("output_text") => text.push_str(part.get("text").and_then(Value::as_str).unwrap_or_default()),
                 // The refusal text itself is not repeated: it is model-authored and unbounded.
-                Some("refusal") => return Err(fatal(JevError::Api("model refused to answer the questions".into()))),
+                Some("refusal") => return Err(fatal(DecisionError::Api("model refused to answer the questions".into()))),
                 _ => {}
             }
         }
@@ -353,7 +338,7 @@ fn output_text(settled: &Settled) -> Result<String, Failure> {
         text = settled.streamed.clone();
     }
     if text.trim().is_empty() {
-        return Err(fatal(JevError::Api("model run completed without returning any output text".into())));
+        return Err(fatal(DecisionError::Api("model run completed without returning any output text".into())));
     }
     Ok(text)
 }
@@ -503,7 +488,8 @@ impl ChatGptClient {
         let settled = terminal_response(body)?;
         // A completed run is a real request against the subscription whether or not its output is
         // usable, so it is counted before the output is judged.
-        self.usage.add(settled.response.get("usage"));
+        let tokens = |field: &str| settled.response.get("usage").and_then(|u| u.get(field)).and_then(Value::as_u64).unwrap_or(0);
+        self.usage.record(tokens("input_tokens"), tokens("output_tokens"));
         let tier = settled
             .response
             .get("service_tier")
@@ -521,21 +507,21 @@ impl ChatGptClient {
         let text = output_text(&settled)?;
         // The parse error names a position, never the content at it.
         let parsed: Value = serde_json::from_str(&text)
-            .map_err(|_| fatal(JevError::Api("model output was not JSON; the response schema was not honoured".into())))?;
+            .map_err(|_| fatal(DecisionError::Api("model output was not JSON; the response schema was not honoured".into())))?;
         if parsed.as_object().is_none_or(|object| object.len() != 1) {
-            return Err(fatal(JevError::Api("model output must contain only the `answers` object".into())));
+            return Err(fatal(DecisionError::Api("model output must contain only the `answers` object".into())));
         }
         match parsed.get("answers") {
             Some(Value::Object(answers)) => decode_answers(questions, answers).map_err(fatal),
-            _ => Err(fatal(JevError::Api("model output has no `answers` object".into()))),
+            _ => Err(fatal(DecisionError::Api("model output has no `answers` object".into()))),
         }
     }
 
     /// The `answers` map for `questions`, judged against `state`. Retries transient failures with
     /// backoff. Every question is answered or the whole call fails.
-    pub fn ask(&self, state: &Value, questions: &Map<String, Value>) -> Result<Map<String, Value>, JevError> {
+    pub fn ask(&self, state: &Value, questions: &Map<String, Value>) -> Result<Map<String, Value>, DecisionError> {
         if let Some(problem) = &self.config_error {
-            return Err(JevError::Api(problem.clone()));
+            return Err(DecisionError::Api(problem.clone()));
         }
         // Nothing to ask is not worth a round trip, and an empty schema is not valid strict JSON.
         if questions.is_empty() {
@@ -545,7 +531,7 @@ impl ChatGptClient {
         let mut last = String::from("unknown error");
         for attempt in 0..=self.max_retries {
             if attempt > 0 {
-                self.usage.add_retry();
+                self.usage.record_retry();
                 self.sleep((0.5 * 2f64.powi(attempt as i32 - 1)).min(30.0) * (0.5 + jitter()));
             }
             self.limiter.acquire();
@@ -587,13 +573,13 @@ impl ChatGptClient {
             };
             let status = reply.status;
             if status == 401 || status == 403 {
-                return Err(JevError::Auth(format!(
+                return Err(DecisionError::Auth(format!(
                     "ChatGPT rejected the subscription credentials (HTTP {status}): {shown}. \
                      Sign in again with `jg --backend chatgpt --chatgpt-login <query>`."
                 )));
             }
             if status == 413 || mentions_context_limit(&probe) {
-                return Err(JevError::TokenLimit(format!("HTTP {status}: {shown}")));
+                return Err(DecisionError::TokenLimit(format!("HTTP {status}: {shown}")));
             }
             // Only the parsed, bounded delay is logged; the header itself is server-controlled.
             let retry_after = reply.retry_after.and_then(|v| v.trim().parse::<f64>().ok()).map(|s| s.clamp(0.0, 30.0));
@@ -605,9 +591,9 @@ impl ChatGptClient {
                 }
                 continue;
             }
-            return Err(JevError::Api(format!("HTTP {status}: {shown}")));
+            return Err(DecisionError::Api(format!("HTTP {status}: {shown}")));
         }
-        Err(JevError::Api(format!("gave up after {} retries: {last}", self.max_retries)))
+        Err(DecisionError::Api(format!("gave up after {} retries: {last}", self.max_retries)))
     }
 }
 
@@ -685,7 +671,7 @@ mod tests {
         (c, seen)
     }
 
-    fn ask_err(body: String) -> JevError {
+    fn ask_err(body: String) -> DecisionError {
         client(move |_: &[u8]| ok(body.clone())).ask(&json!({}), &questions()).unwrap_err()
     }
 
@@ -774,23 +760,23 @@ mod tests {
         let mut qs = Map::new();
         qs.insert("q".into(), json!({"type": "freeform", "instructions": "Summarise."}));
         let err = client(|_: &[u8]| panic!("must not reach the wire")).ask(&json!({}), &qs).unwrap_err();
-        let JevError::Api(message) = &err else { panic!("{err:?}") };
+        let DecisionError::Api(message) = &err else { panic!("{err:?}") };
         assert!(message.contains("unsupported type `freeform`") && message.contains("`noul` and `score`"), "{message}");
 
         let mut missing = Map::new();
         missing.insert("q".into(), json!({"instructions": "?"}));
-        assert!(matches!(request_schema(&missing), Err(JevError::Api(m)) if m.contains("no `type`")));
+        assert!(matches!(request_schema(&missing), Err(DecisionError::Api(m)) if m.contains("no `type`")));
 
         let mut bad = Map::new();
         bad.insert("q".into(), json!({"type": "score", "instructions": "?"}));
-        assert!(matches!(request_schema(&bad), Err(JevError::Api(m)) if m.contains("no `criteria`")));
+        assert!(matches!(request_schema(&bad), Err(DecisionError::Api(m)) if m.contains("no `criteria`")));
     }
 
     #[test]
     fn schema_over_the_property_budget_is_a_token_limit() {
         let qs: Map<String, Value> = (0..5000).map(|i| (format!("q{i}"), json!({"type": "noul", "instructions": "?"}))).collect();
         let err = client(|_: &[u8]| panic!("must not reach the wire")).ask(&json!({}), &qs).unwrap_err();
-        let JevError::TokenLimit(message) = &err else { panic!("{err:?}") };
+        let DecisionError::TokenLimit(message) = &err else { panic!("{err:?}") };
         assert!(message.contains("5000") && message.contains("fewer questions"), "{message}");
         // A batch the size of a default 150-line chunk stays well inside the budget.
         let small: Map<String, Value> = (0..600).map(|i| (format!("q{i}"), json!({"type": "noul", "instructions": "?"}))).collect();
@@ -904,14 +890,14 @@ mod tests {
             json!({"type": "response.completed", "response": {"output": []}}),
         );
         let err = client(move |_: &[u8]| ok(body.clone())).ask(&json!({}), &questions()).unwrap_err();
-        assert!(matches!(&err, JevError::Api(m) if m.contains("refused")), "{err:?}");
+        assert!(matches!(&err, DecisionError::Api(m) if m.contains("refused")), "{err:?}");
     }
 
     #[test]
     fn a_completed_run_with_no_text_anywhere_is_an_error() {
         let body = format!("data: {}\n\n", json!({"type": "response.completed", "response": {"status": "completed", "output": []}}));
         let err = client(move |_: &[u8]| ok(body.clone())).ask(&json!({}), &questions()).unwrap_err();
-        assert!(matches!(&err, JevError::Api(m) if m.contains("without returning any output text")), "{err:?}");
+        assert!(matches!(&err, DecisionError::Api(m) if m.contains("without returning any output text")), "{err:?}");
     }
 
     #[test]
@@ -937,7 +923,7 @@ mod tests {
         });
         let err = c.ask(&json!({}), &questions()).unwrap_err();
         // The code is short and code-shaped, so it is shown; the server's prose never is.
-        assert_eq!(err, JevError::Api("model run failed: invalid_request_error".into()));
+        assert_eq!(err, DecisionError::Api("model run failed: invalid_request_error".into()));
         assert_eq!(*calls.lock().unwrap(), 1);
         assert_eq!(c.usage.requests(), 0);
     }
@@ -951,7 +937,7 @@ mod tests {
             ok("data: {\"type\":\"error\",\"error\":{\"code\":\"invalid_token\",\"message\":\"expired\"}}\n\n".into())
         });
         let err = c.ask(&json!({}), &questions()).unwrap_err();
-        assert!(matches!(&err, JevError::Auth(m) if m.contains("invalid_token") && m.contains("--chatgpt-login")), "{err:?}");
+        assert!(matches!(&err, DecisionError::Auth(m) if m.contains("invalid_token") && m.contains("--chatgpt-login")), "{err:?}");
         assert_eq!(*calls.lock().unwrap(), 1, "expired credentials are not worth retrying");
     }
 
@@ -978,14 +964,14 @@ mod tests {
     #[test]
     fn stream_level_context_limit_is_a_token_limit() {
         let err = ask_err("data: {\"type\":\"error\",\"error\":{\"code\":\"context_length_exceeded\"}}\n\n".into());
-        assert!(matches!(&err, JevError::TokenLimit(m) if m.contains("context_length_exceeded")), "{err:?}");
+        assert!(matches!(&err, DecisionError::TokenLimit(m) if m.contains("context_length_exceeded")), "{err:?}");
     }
 
     #[test]
     fn incomplete_response_asks_the_caller_to_split() {
         let event = json!({"type": "response.incomplete", "response": {"incomplete_details": {"reason": "max_output_tokens"}}});
         let err = ask_err(format!("data: {event}\n\n"));
-        let JevError::TokenLimit(message) = &err else { panic!("{err:?}") };
+        let DecisionError::TokenLimit(message) = &err else { panic!("{err:?}") };
         assert!(message.contains("output budget") && message.contains("fewer questions"), "{message}");
     }
 
@@ -994,7 +980,7 @@ mod tests {
     fn a_content_filter_stop_is_not_a_token_limit() {
         let event = json!({"type": "response.incomplete", "response": {"incomplete_details": {"reason": "content_filter"}}});
         let err = ask_err(format!("data: {event}\n\n"));
-        assert!(matches!(&err, JevError::Api(m) if m.contains("content filter")), "{err:?}");
+        assert!(matches!(&err, DecisionError::Api(m) if m.contains("content filter")), "{err:?}");
     }
 
     #[test]
@@ -1008,7 +994,7 @@ mod tests {
                 },
             });
             let err = ask_err(format!("data: {event}\n\n"));
-            assert!(matches!(&err, JevError::Api(m) if m.contains("unexpected state")), "{status} -> {err:?}");
+            assert!(matches!(&err, DecisionError::Api(m) if m.contains("unexpected state")), "{status} -> {err:?}");
         }
     }
 
@@ -1018,7 +1004,7 @@ mod tests {
             "type": "response.completed",
             "response": {"status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"}, "output": []},
         });
-        assert!(matches!(ask_err(format!("data: {event}\n\n")), JevError::TokenLimit(_)));
+        assert!(matches!(ask_err(format!("data: {event}\n\n")), DecisionError::TokenLimit(_)));
     }
 
     #[test]
@@ -1028,7 +1014,7 @@ mod tests {
             "response": {"output": [{"type": "message", "content": [{"type": "refusal", "refusal": "I cannot help with that."}]}]},
         });
         let err = ask_err(format!("data: {event}\n\n"));
-        assert!(matches!(&err, JevError::Api(m) if m.contains("refused")), "{err:?}");
+        assert!(matches!(&err, DecisionError::Api(m) if m.contains("refused")), "{err:?}");
         // The refusal wording is model-authored and unbounded; it is classified, never repeated.
         assert!(!err.to_string().contains("I cannot help"), "{err}");
     }
@@ -1057,14 +1043,14 @@ mod tests {
             ok("data: {not json\n\n".into())
         });
         let err = c.ask(&json!({}), &questions()).unwrap_err();
-        assert!(matches!(&err, JevError::Api(m) if m.contains("gave up after 3 retries") && m.contains("unreadable")), "{err:?}");
+        assert!(matches!(&err, DecisionError::Api(m) if m.contains("gave up after 3 retries") && m.contains("unreadable")), "{err:?}");
         assert_eq!(*calls.lock().unwrap(), 4);
     }
 
     #[test]
     fn output_that_is_not_json_is_rejected() {
         let err = ask_err(completed_stream("I think line 4 is relevant."));
-        assert!(matches!(&err, JevError::Api(m) if m.contains("not JSON")), "{err:?}");
+        assert!(matches!(&err, DecisionError::Api(m) if m.contains("not JSON")), "{err:?}");
         // The run completed, so it still counts as a request the subscription paid for.
         let c = client(|_: &[u8]| ok(completed_stream("nope")));
         let _ = c.ask(&json!({}), &questions());
@@ -1074,7 +1060,7 @@ mod tests {
     #[test]
     fn a_missing_question_fails_rather_than_defaulting_to_zero() {
         let err = ask_err(completed_stream(&json!({"answers": {"0": 50}}).to_string()));
-        assert!(matches!(&err, JevError::Api(m) if m.contains("1 of 2 questions unanswered") && m.contains("q0.rel")), "{err:?}");
+        assert!(matches!(&err, DecisionError::Api(m) if m.contains("1 of 2 questions unanswered") && m.contains("q0.rel")), "{err:?}");
     }
 
     #[test]
@@ -1083,7 +1069,7 @@ mod tests {
         body["answers"]["q9.invented"] = json!(50);
         let err = ask_err(completed_stream(&body.to_string()));
         // The invented id is counted, not quoted: that string came from the model.
-        assert!(matches!(&err, JevError::Api(m) if m.contains("1 answer(s) to questions that were not asked")), "{err:?}");
+        assert!(matches!(&err, DecisionError::Api(m) if m.contains("1 answer(s) to questions that were not asked")), "{err:?}");
         assert!(!err.to_string().contains("q9.invented"), "{err}");
     }
 
@@ -1091,9 +1077,9 @@ mod tests {
     #[test]
     fn wrong_answer_type_is_rejected() {
         let err = ask_err(completed_stream(&wire(score_answer(), score_answer())));
-        assert!(matches!(&err, JevError::Api(m) if m.contains("`q0.L4`") && m.contains("not a percentage")), "{err:?}");
+        assert!(matches!(&err, DecisionError::Api(m) if m.contains("`q0.L4`") && m.contains("not a percentage")), "{err:?}");
         let err = ask_err(completed_stream(&wire(json!(50), json!(50))));
-        assert!(matches!(&err, JevError::Api(m) if m.contains("`q0.rel`") && m.contains("exactly the fields")), "{err:?}");
+        assert!(matches!(&err, DecisionError::Api(m) if m.contains("`q0.rel`") && m.contains("exactly the fields")), "{err:?}");
     }
 
     /// Strict mode forbids extra properties, so an answer carrying one did not follow the schema.
@@ -1102,7 +1088,7 @@ mod tests {
         let mut answer = score_answer();
         answer["note"] = json!("see line 4");
         let err = ask_err(completed_stream(&wire(json!(50), answer)));
-        assert!(matches!(&err, JevError::Api(m) if m.contains("`q0.rel`") && m.contains("exactly the fields")), "{err:?}");
+        assert!(matches!(&err, DecisionError::Api(m) if m.contains("`q0.rel`") && m.contains("exactly the fields")), "{err:?}");
     }
 
     #[test]
@@ -1110,7 +1096,7 @@ mod tests {
         for answer in [json!(101), json!(-1), json!("90"), Value::Null, json!({"type": "noul", "noul": 0.9})] {
             let err = ask_err(completed_stream(&wire(answer.clone(), score_answer())));
             assert!(
-                matches!(&err, JevError::Api(m) if m.contains("`q0.L4`") && m.contains("percentage in 0..=100")),
+                matches!(&err, DecisionError::Api(m) if m.contains("`q0.L4`") && m.contains("percentage in 0..=100")),
                 "{answer} -> {err:?}"
             );
         }
@@ -1133,7 +1119,7 @@ mod tests {
             let mut answer = score_answer();
             answer[field] = value.clone();
             let err = ask_err(completed_stream(&wire(json!(10), answer)));
-            assert!(matches!(&err, JevError::Api(m) if m.contains("`q0.rel`") && m.contains(expected)), "{field}={value} -> {err:?}");
+            assert!(matches!(&err, DecisionError::Api(m) if m.contains("`q0.rel`") && m.contains(expected)), "{field}={value} -> {err:?}");
         }
     }
 
@@ -1159,7 +1145,7 @@ mod tests {
         for literal in ["NaN", "Infinity", "-Infinity", "1e999"] {
             let body = format!("{{\"answers\":{{\"0\":{literal}}}}}");
             let err = client(move |_: &[u8]| ok(completed_stream(&body))).ask(&json!({}), &noul_only()).unwrap_err();
-            assert!(matches!(&err, JevError::Api(m) if m.contains("not JSON") || m.contains("0..=100")), "{literal} -> {err:?}");
+            assert!(matches!(&err, DecisionError::Api(m) if m.contains("not JSON") || m.contains("0..=100")), "{literal} -> {err:?}");
         }
     }
 
@@ -1172,7 +1158,7 @@ mod tests {
             Ok(Reply { status: 401, retry_after: None, body: json!({"error": {"code": "invalid_token"}}).to_string() })
         });
         let err = c.ask(&json!({}), &questions()).unwrap_err();
-        assert!(matches!(&err, JevError::Auth(m) if m.contains("HTTP 401") && m.contains("invalid_token")), "{err:?}");
+        assert!(matches!(&err, DecisionError::Auth(m) if m.contains("HTTP 401") && m.contains("invalid_token")), "{err:?}");
         assert_eq!(*calls.lock().unwrap(), 1);
     }
 
@@ -1198,18 +1184,18 @@ mod tests {
     #[test]
     fn http_413_and_context_errors_are_token_limits() {
         let c = client(|_: &[u8]| Ok(Reply { status: 413, retry_after: None, body: "{}".into() }));
-        assert!(matches!(c.ask(&json!({}), &questions()), Err(JevError::TokenLimit(_))));
+        assert!(matches!(c.ask(&json!({}), &questions()), Err(DecisionError::TokenLimit(_))));
         let c = client(|_: &[u8]| {
             Ok(Reply { status: 400, retry_after: None, body: "{\"error\":{\"code\":\"context_length_exceeded\"}}".into() })
         });
-        assert!(matches!(c.ask(&json!({}), &questions()), Err(JevError::TokenLimit(_))));
+        assert!(matches!(c.ask(&json!({}), &questions()), Err(DecisionError::TokenLimit(_))));
     }
 
     #[test]
     fn connection_failures_are_retried_and_then_surfaced() {
         let c = client(|_: &[u8]| Err("connection reset".into()));
         let err = c.ask(&json!({}), &questions()).unwrap_err();
-        assert_eq!(err, JevError::Api("gave up after 3 retries: connection reset".into()));
+        assert_eq!(err, DecisionError::Api("gave up after 3 retries: connection reset".into()));
         assert_eq!((c.usage.requests(), c.usage.retries()), (0, 3));
     }
 
@@ -1423,7 +1409,7 @@ mod tests {
         let mut c = client(|_: &[u8]| panic!("must not reach the wire"));
         c.config_error = validate_url("http://evil.test/v1?token=sk-live-SECRET").err();
         let err = c.ask(&json!({}), &questions()).unwrap_err();
-        assert!(matches!(&err, JevError::Api(m) if m.contains("refusing to send ChatGPT credentials")), "{err:?}");
+        assert!(matches!(&err, DecisionError::Api(m) if m.contains("refusing to send ChatGPT credentials")), "{err:?}");
         // A base URL can itself carry a secret, so it is never quoted back.
         assert!(!err.to_string().contains("sk-live-SECRET") && !err.to_string().contains("evil.test"), "{err}");
     }

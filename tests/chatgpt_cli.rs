@@ -613,7 +613,7 @@ fn help_documents_chatgpt_backend_without_reading_credentials() {
     assert!(run.out.contains("JG_BACKEND"));
     assert!(run.out.contains(CHATGPT_MODEL));
     assert!(run.out.contains("chatgpt"));
-    assert_ne!(DEFAULT_CHATGPT_URL, jevgrep::client::DEFAULT_BASE_URL);
+    assert_ne!(DEFAULT_CHATGPT_URL, typesafe_jev::DEFAULT_BASE_URL);
     assert_no_secrets(&run);
 }
 

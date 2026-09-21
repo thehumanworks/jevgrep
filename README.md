@@ -448,6 +448,13 @@ cargo build --release && python3 bench/bench.py   # opt-in; needs TYPESAFE_API_K
 JG_DEBUG=1 jg ...                                 # log retry reasons
 ```
 
+The Jev client itself is a separate crate, [`typesafe-jev`](crates/typesafe-jev/README.md), in
+the same workspace: the request and reply shape, retries, the adaptive concurrency gate and usage
+accounting, with no `jg` policy in it (the `fnox` key lookup, `JG_DEBUG` and the `jg/` user agent
+stay here). `cargo test`, `cargo clippy` and `cargo doc` at the root cover both crates. Publishing
+it is `cargo publish -p typesafe-jev`, separate from a `jg` release
+([ADR 0009](docs/adr/0009-jev-client-crate.md)).
+
 The Rust integration tests run the real binary against local HTTP servers. The PTY harness
 uses Python's standard library, bounded waits, process reaping and server cleanup; it does
 not snapshot animation timing. `tests/chatgpt_cli.rs` and `tests/openai_cli.rs` use tiny local

@@ -16,7 +16,7 @@ fn repo(name: &str) -> std::path::PathBuf {
 
 /// Live tests explicitly forward only the caller's API key, not their home/config.
 fn jg(dir: &Path, args: &[&str]) -> common::Ran {
-    let key = jevgrep::client::resolve_api_key().expect("live tests require TYPESAFE_API_KEY (or fnox)");
+    let key = jevgrep::jev::resolve_api_key().expect("live tests require TYPESAFE_API_KEY (or fnox)");
     common::ran(common::command(dir).args(args).env("TYPESAFE_API_KEY", key).output().unwrap())
 }
 

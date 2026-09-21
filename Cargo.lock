@@ -394,6 +394,7 @@ dependencies = [
  "regex-lite",
  "serde_json",
  "toml",
+ "typesafe-jev",
  "ureq",
 ]
 
@@ -725,6 +726,14 @@ dependencies = [
  "serde_spanned",
  "toml_datetime",
  "winnow",
+]
+
+[[package]]
+name = "typesafe-jev"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "ureq",
 ]
 
 [[package]]
