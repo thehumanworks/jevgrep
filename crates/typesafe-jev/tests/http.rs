@@ -6,8 +6,8 @@ use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use serde_json::{json, Map, Value};
-use typesafe_jev::{Client, Config, Error};
+use serde_json::{json, Value};
+use typesafe_jev::{Client, Config, Error, Noul, Questions};
 
 #[derive(Debug, Clone)]
 struct Request {
@@ -80,19 +80,22 @@ fn serve(
     (url, seen)
 }
 
-fn questions() -> Map<String, Value> {
-    let mut qs = Map::new();
-    qs.insert("q".into(), json!({"type": "noul", "instructions": "Is it?"}));
-    qs
+fn questions() -> Questions {
+    Questions::new().with("q", Noul::new("Is it?"))
 }
 
 #[test]
 fn posts_json_with_a_bearer_token_and_the_configured_user_agent() {
-    let (url, seen) =
-        serve(|_| (200, vec![], json!({"answers": {"q": {"type": "noul", "noul": 0.7}}, "usage": {"input_tokens": 9}}).to_string()));
+    let (url, seen) = serve(|_| {
+        (
+            200,
+            vec![],
+            json!({"model": "jev-test", "answers": {"q": {"type": "noul", "noul": 0.7}}, "usage": {"input_tokens": 9}}).to_string(),
+        )
+    });
     let c = Client::new("sk-test", Config { base_url: url, user_agent: "probe/1.0".into(), ..Config::default() }).unwrap();
     let answers = c.ask(&json!({"n": 1}), &questions()).unwrap();
-    assert_eq!(answers["q"]["noul"], 0.7);
+    assert_eq!(answers.noul("q").unwrap().noul, 0.7);
     assert_eq!((c.usage().requests(), c.usage().input_tokens(), c.usage().output_tokens()), (1, 9, 0));
     let seen = seen.lock().unwrap();
     assert_eq!(seen.len(), 1);
@@ -109,9 +112,9 @@ fn posts_json_with_a_bearer_token_and_the_configured_user_agent() {
 
 #[test]
 fn the_default_user_agent_names_this_crate() {
-    let (url, seen) = serve(|_| (200, vec![], json!({"answers": {}}).to_string()));
+    let (url, seen) = serve(|_| (200, vec![], json!({"model": "jev-test", "answers": {}}).to_string()));
     let c = Client::new("sk-test", Config { base_url: url, ..Config::default() }).unwrap();
-    assert!(c.ask(&json!({}), &Map::new()).unwrap().is_empty());
+    assert!(c.ask(&json!({}), &Questions::new()).unwrap().answers.is_empty());
     let seen = seen.lock().unwrap();
     let agent = seen[0].header("user-agent").unwrap();
     assert_eq!(agent, format!("typesafe-jev/{}", env!("CARGO_PKG_VERSION")));
@@ -152,7 +155,7 @@ fn an_unreachable_endpoint_is_retried_then_reported() {
 
 #[test]
 fn a_key_or_a_config_that_cannot_be_sent_is_refused_before_any_request() {
-    let (url, seen) = serve(|_| (200, vec![], json!({"answers": {}}).to_string()));
+    let (url, seen) = serve(|_| (200, vec![], json!({"model": "jev-test", "answers": {}}).to_string()));
     let at = |base_url: &str| Config { base_url: base_url.into(), ..Config::default() };
     for key in ["", "  \n", "sk\nsecret-half", "sk-\u{7f}"] {
         let err = Client::new(key, at(&url)).unwrap_err();
@@ -171,9 +174,9 @@ fn a_key_or_a_config_that_cannot_be_sent_is_refused_before_any_request() {
 
 #[test]
 fn whitespace_around_the_key_is_dropped_and_debug_output_omits_the_key() {
-    let (url, seen) = serve(|_| (200, vec![], json!({"answers": {}}).to_string()));
+    let (url, seen) = serve(|_| (200, vec![], json!({"model": "jev-test", "answers": {}}).to_string()));
     let c = Client::new(" sk-from-a-file\n", Config { base_url: url, ..Config::default() }).unwrap();
-    c.ask(&json!({}), &Map::new()).unwrap();
+    c.ask(&json!({}), &Questions::new()).unwrap();
     assert_eq!(seen.lock().unwrap()[0].header("authorization"), Some("Bearer sk-from-a-file"));
     let shown = format!("{c:?}");
     assert!(shown.starts_with("Client {") && shown.contains("jev-latest") && shown.contains("requests: 1"), "{shown}");

@@ -94,14 +94,14 @@ fn flat_output_never_carries_weak_tier_rows() {
             .iter()
             .map(|(k, q)| {
                 let answer = if q["type"] == "score" {
-                    json!({"type": "score", "score": 2.7, "confidence": 0.9})
+                    json!({"type": "score", "score": 2.7, "confidence": 0.9, "probabilities": {}, "legend": {}})
                 } else {
                     json!({"type": "noul", "noul": if k.contains(".B") { 0.41 } else { 0.1 }})
                 };
                 (k.clone(), answer)
             })
             .collect();
-        (200, json!({"answers": answers, "usage": {}}).to_string())
+        (200, json!({"model": "jev-test", "answers": answers, "usage": {}}).to_string())
     });
     let dir = repo("weak", &[("t.py", "a = 1\nb = 2\n")]);
     let run = jg(&dir, &url, &["q", "-q"]);
@@ -129,7 +129,7 @@ fn filter_server() -> String {
             .map(|(qid, q)| {
                 let text = q["instructions"].as_str().unwrap();
                 let answer = if q["type"] == "score" {
-                    json!({"type": "score", "score": 3.0, "confidence": 0.9})
+                    json!({"type": "score", "score": 3.0, "confidence": 0.9, "probabilities": {}, "legend": {}})
                 } else if qid.starts_with('F') && (text.contains("documentation") || text.contains("Source code")) {
                     let docs = path.ends_with(".md");
                     json!({"type": "noul", "noul": if docs == text.contains("documentation") { 0.97 } else { 0.03 }})
@@ -142,7 +142,7 @@ fn filter_server() -> String {
                 (qid.clone(), answer)
             })
             .collect();
-        (200, json!({"answers": answers, "usage": {"input_tokens": 50}}).to_string())
+        (200, json!({"model": "jev-test", "answers": answers, "usage": {"input_tokens": 50}}).to_string())
     })
 }
 

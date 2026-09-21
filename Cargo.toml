@@ -17,7 +17,7 @@ default-members = [".", "crates/typesafe-jev"]
 
 [dependencies]
 ignore = "0.4"
-typesafe-jev = { version = "0.1.0", path = "crates/typesafe-jev" }
+typesafe-jev = { version = "0.2.0", path = "crates/typesafe-jev" }
 clap = { version = "4.6.7", features = ["derive", "wrap_help"] }
 console = "0.16.6"
 indicatif = "0.18.6"

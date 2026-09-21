@@ -28,11 +28,11 @@ class FakeAPI(http.server.BaseHTTPRequestHandler):
         answers = {}
         for name, question in body["questions"].items():
             if question["type"] == "score":
-                answer = {"type": "score", "score": 3.0, "confidence": 0.9}
+                answer = {"type": "score", "score": 3.0, "confidence": 0.9, "probabilities": {}, "legend": {}}
             else:
                 answer = {"type": "noul", "noul": 0.9 if ".B" in name else (0.95 if name.endswith(".L2") else 0.02)}
             answers[name] = answer
-        payload = json.dumps({"answers": answers, "usage": {"input_tokens": 100}}).encode()
+        payload = json.dumps({"model": "jev-test", "answers": answers, "usage": {"input_tokens": 100}}).encode()
         status = 422 if body.get("state", {}).get("file", "").endswith(self.server.failed_filename) else self.server.status
         if self.server.retry_once:
             self.server.retry_once = False

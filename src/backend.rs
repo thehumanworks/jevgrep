@@ -42,9 +42,19 @@ pub trait DecisionBackend: Send + Sync {
     }
 }
 
+/// The contract above is Jev's JSON, because the other backends build prompts and schemas from
+/// it; Jev's own client is typed. The questions are read into its types and written back out in
+/// the same order with the same fields, so what goes over the wire is what `jg` built.
 impl DecisionBackend for typesafe_jev::Client {
     fn ask(&self, state: &Value, questions: &Map<String, Value>) -> Result<Map<String, Value>, DecisionError> {
-        typesafe_jev::Client::ask(self, state, questions)
+        let typed: typesafe_jev::Questions =
+            serde_json::from_value(Value::Object(questions.clone())).map_err(|e| DecisionError::Api(format!("unusable question: {e}")))?;
+        let response = typesafe_jev::Client::ask(self, state, &typed)?;
+        match serde_json::to_value(response.answers) {
+            Ok(Value::Object(answers)) => Ok(answers),
+            Ok(_) => Err(DecisionError::Api("answers are not an object".into())),
+            Err(e) => Err(DecisionError::Api(e.to_string())),
+        }
     }
 
     fn usage(&self) -> &Usage {

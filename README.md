@@ -453,8 +453,9 @@ JG_DEBUG=1 jg ...                                 # log retry reasons
 ```
 
 The Jev client itself is a separate crate, [`typesafe-jev`](crates/typesafe-jev/README.md), in
-the same workspace: the request and reply shape, retries, the adaptive concurrency gate and usage
-accounting, with no `jg` policy in it (the `fnox` key lookup, `JG_DEBUG` and the `jg/` user agent
+the same workspace: TypeSafe's question and answer types
+([ADR 0011](docs/adr/0011-typed-questions-and-answers.md)), retries, the adaptive concurrency gate
+and usage accounting, with no `jg` policy in it (the `fnox` key lookup, `JG_DEBUG` and the `jg/` user agent
 stay here). `cargo test`, `cargo clippy` and `cargo doc` at the root cover both crates. Publishing
 it is `cargo publish -p typesafe-jev`, separate from a `jg` release
 ([ADR 0009](docs/adr/0009-jev-client-crate.md)).

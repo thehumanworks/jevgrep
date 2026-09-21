@@ -5,52 +5,63 @@
 [![MSRV 1.85](https://img.shields.io/badge/rustc-1.85+-blue.svg)](#compatibility)
 [![license](https://img.shields.io/crates/l/typesafe-jev.svg)](#license)
 
-A Rust client for [TypeSafe](https://typesafe.ai)'s System One API and its Jev model.
+A typed Rust client for [TypeSafe](https://typesafe.ai)'s System One API and its Jev model.
 
-Jev does not generate text. You send a JSON `state` and a map of typed questions about it, and
-get back one calibrated answer per question. Every question in a request is evaluated against
-the same state in parallel, so a request with hundreds of questions takes about as long as one
-with a single question.
+Jev does not generate text. You send a `state` and a set of typed questions about it, and get
+back one calibrated answer per question. Every question in a request is evaluated against the
+same state in parallel, so a request with hundreds of questions takes about as long as one with
+a single question.
+
+The three question types of the [API reference](https://docs.typesafe.ai/api), `Noul`, `Choice`
+and `Score`, and their answers are Rust types here, field for field, so a misspelt field or a
+missing `criteria` is a compile error rather than an HTTP 422.
 
 This crate is the client that [jevgrep](https://github.com/thehumanworks/jevgrep) (`jg`,
 natural-language code search) uses for its default backend, extracted so that it can be used on
-its own. It has no async runtime and two dependencies: `serde_json` for the JSON, and `ureq` with
-rustls for the HTTPS. It is an independent client, not an official TypeSafe SDK.
+its own. It has no async runtime; its dependencies are `serde` and `serde_json` for the JSON,
+`indexmap` to keep questions and options in the order you give them, and `ureq` with rustls for
+the HTTPS. It is an independent client, not an official TypeSafe SDK.
 
 ## Usage
 
 ```toml
 [dependencies]
-typesafe-jev = "0.1"
-serde_json = "1"
+typesafe-jev = "0.2"
 ```
 
 ```rust,no_run
-use serde_json::{json, Map};
-use typesafe_jev::{Client, Config};
+use typesafe_jev::{Choice, Client, Config, Noul, Questions, Score};
 
 fn main() -> Result<(), typesafe_jev::Error> {
     let client = Client::from_env(Config::default())?; // reads TYPESAFE_API_KEY
 
-    let state = json!({
-        "code": "1| import os\n2| def cwd():\n3|     return os.getcwd()",
-        "query": "where is the working directory read",
-    });
-    let mut questions = Map::new();
-    questions.insert("line3".into(), json!({
-        "type": "noul",
-        "instructions": "Does line 3 of the code directly answer the query?",
-    }));
-    questions.insert("relevance".into(), json!({
-        "type": "score",
-        "instructions": "How relevant is the code to the query?",
-        "criteria": ["unrelated", "tangential", "relevant", "exactly what was asked"],
-    }));
+    let ticket = "Hi, I've been trying to connect my Stripe account for 3 days and the \
+                  integration keeps failing. I'm losing sales. Please help ASAP.";
+    let questions = Questions::new()
+        .with("department", Choice::new("Which team should handle this?", [
+            ("billing", "Payment or subscription issues"),
+            ("technical", "Bugs or integration problems"),
+            ("sales", "Pricing or account questions"),
+        ]))
+        .with("frustration", Score::new("How frustrated the customer appears", [
+            "Calm, just stating facts",
+            "Frustrated but civil",
+            "Very angry, strong language",
+        ]))
+        .with("is_urgent", Noul::new("The message conveys urgency or time-sensitivity"));
 
-    let answers = client.ask(&state, &questions)?;
-    let p = answers["line3"]["noul"].as_f64().unwrap_or(0.0);
-    let score = answers["relevance"]["score"].as_f64().unwrap_or(0.0);
-    println!("line 3 answers the query with p={p:.2}; relevance {score:.1}");
+    let response = client.ask(ticket, &questions)?;
+
+    let department = response.choice("department").expect("asked as a choice");
+    println!("{} (confidence {:.2})", department.choice, department.confidence); // technical (0.78)
+    for (option, probability) in &department.probabilities {
+        println!("  {option}: {probability:.2}"); // billing: 0.15, technical: 0.85, sales: 0.00
+    }
+    let frustration = response.score("frustration").expect("asked as a score");
+    println!("level {:.1} of 2", frustration.score); // 1.0
+    let urgent = response.noul("is_urgent").expect("asked as a noul");
+    println!("urgent with p={:.2}", urgent.noul); // 1.00
+
     println!("{} input tokens, ~${:.4}", client.usage().input_tokens(), client.usage().cost_usd());
     Ok(())
 }
@@ -79,30 +90,57 @@ fn main() -> Result<(), Error> {
 
 ## Questions and answers
 
-- `noul` asks a yes/no question. The answer is
-  `{"type": "noul", "noul": p}`, with `p` the probability in [0, 1] that the answer is yes.
-- `score` asks for a judgment on an ordered scale. The question lists its `criteria`, one per
-  level, in order; the answer is `{"type": "score", "score": s, "confidence": c,
-  "probabilities": {...}, "legend": {...}}`, with `s` a position on that scale counted from the
-  first criterion.
+| Question | Asks | Answer |
+| --- | --- | --- |
+| `Noul::new(instructions)`, optionally `.yes(..)` and `.no(..)` | a yes/no question | `NoulAnswer { noul }`: the probability of a yes, from 0 to 1 |
+| `Choice::new(instructions, [(option, description), ..])`, or `Choice::labels(instructions, [option, ..])` | for one option out of up to 255 | `ChoiceAnswer { choice, confidence, probabilities }` |
+| `Score::new(instructions, [level, ..])` | for a rating against 2 to 10 ordered levels | `ScoreAnswer { score, confidence, legend, probabilities }`, with levels numbered from 0 |
 
-The probabilities are calibrated: a `noul` of 0.9 is right about nine times in ten. The
-`questions` map is sent as given, so any field the API accepts can be used.
+- The probabilities are calibrated: of the `noul` answers given as 0.9, about nine in ten are a
+  yes. `confidence` says how far to trust a `choice` or a `score`; see TypeSafe's
+  [confidence](https://docs.typesafe.ai/confidence) page.
+- `Questions` keeps its questions, and a `Choice` its options, in the order you add them, and that
+  is the order on the wire. `Response::noul`, `choice` and `score` look an answer up by id and
+  type; `response.answers` is the whole ordered map of `Answer`s.
+- Instructions and descriptions are `Content`: a `&str` or `String` converts with `into()`, and
+  `Content::try_from(json!({...}))` takes the structured form, where a question names its own
+  data fields in backticks:
+
+  ```rust
+  use serde_json::json;
+  use typesafe_jev::{Content, Noul};
+
+  let instructions = Content::try_from(json!({
+      "potential_duplicate": {"name": "John Smith", "location": "Oakland, California"},
+      "question": "Is the resume for the same person as `potential_duplicate`?",
+  }))
+  .expect("an object is content; a number, a boolean or null is not");
+  let question = Noul::new(instructions);
+  ```
+
+- The `state` is anything that serializes to a JSON string, object or array: a `&str`, a
+  `serde_json::Value`, or your own `#[derive(Serialize)]` type. Jev reads text only.
+- Every type implements `Serialize` and `Deserialize`, so questions can live in a config file and
+  answers in a log. A reply is read strictly: an answer that lacks a field the reference requires
+  is an `Error::Api`, not a silent default. Unknown fields are ignored, and the types are
+  `#[non_exhaustive]`, so the API can grow without breaking your build.
 
 ## Retries, concurrency and cost
 
 - Connection failures and transient HTTP statuses (408, 409, 425, 429, 5xx, 529) are retried
   with exponential backoff and jitter, honouring `Retry-After`, up to `Config::max_retries`.
 - Rejected credentials are returned at once as `Error::Auth`; a request too large for the
-  model's context as `Error::TokenLimit`, which the caller should split and retry. Everything
-  else, including retries exhausted, is `Error::Api`. The enum is `#[non_exhaustive]`.
+  model's context as `Error::TokenLimit`, which the caller should split and retry; a body the API
+  refuses as malformed (HTTP 422) as `Error::InvalidRequest`. Everything else, including retries
+  exhausted, is `Error::Api`. The enum is `#[non_exhaustive]`.
 - Calls block. The client is `Send + Sync` and shares one connection pool: call `ask` from as many
   threads as `Config::pool_size`. An `AdaptiveLimiter` caps the concurrency and halves it
   whenever the API throttles, growing it back as requests succeed. TypeSafe's rate limit is a
   sustained token budget with no quota headers, and the limiter is what keeps several processes on
   one key from tripping over each other.
 - `Usage` counts requests, retries and tokens across threads. `Usage::cost_usd` prices the input
-  tokens at Jev's list price (`USD_PER_INPUT_MTOK`); output tokens are free.
+  tokens at Jev's list price (`USD_PER_INPUT_MTOK`); output tokens are free. Each `Response` also
+  carries the `TokenUsage` of its own request, and the `model` that answered it.
 - `Client::set_debug_reporter` receives one line per failed attempt. Nothing is logged otherwise.
 
 ## Testing without the network
@@ -111,17 +149,22 @@ The probabilities are calibrated: a `noul` of 0.9 is right about nine times in t
 `Reply`, so tests and local fakes need no server:
 
 ```rust
-use serde_json::{json, Map};
-use typesafe_jev::{Client, Config, Reply};
+use typesafe_jev::{Client, Config, Noul, Questions, Reply};
 
 let client = Client::with_transport(
-    |_body: &[u8]| Ok(Reply { status: 200, retry_after: None, body: r#"{"answers": {"q": {"type": "noul", "noul": 0.5}}}"#.into() }),
+    |_body: &[u8]| Ok(Reply {
+        status: 200,
+        retry_after: None,
+        body: r#"{"model": "fake", "answers": {"q": {"type": "noul", "noul": 0.5}}}"#.into(),
+    }),
     Config { backoff_scale: 0.0, ..Config::default() },
 );
-let mut questions = Map::new();
-questions.insert("q".into(), json!({"type": "noul", "instructions": "Is the state empty?"}));
-assert_eq!(client.ask(&json!({}), &questions).unwrap()["q"]["noul"], 0.5);
+let response = client.ask("any state", &Questions::new().with("q", Noul::new("Is the state empty?"))).unwrap();
+assert_eq!(response.noul("q").unwrap().noul, 0.5);
 ```
+
+`NoulAnswer::new`, `ChoiceAnswer::new` and `ScoreAnswer::new` build answers for a fake that works
+above the client.
 
 ## Security notes
 
@@ -136,8 +179,9 @@ assert_eq!(client.ask(&json!({}), &questions).unwrap()["q"]["noul"], 0.5);
 ## Compatibility
 
 - The minimum supported Rust version is 1.85, checked in CI. Raising it is a minor version bump.
-- `serde_json` is part of the public API (`Value`, `Map`); `ureq` is not. The lowest versions the
-  manifest allows (`serde_json` 1.0.45, `ureq` 3.0.0) pass the test suite.
+- `serde`, `serde_json` (`Value` and `Map` inside `Content`) and `indexmap` (`IndexMap` in
+  `Choice::criteria`, `ChoiceAnswer::probabilities` and `Response::answers`) are part of the public
+  API; `ureq` is not. The lowest versions the manifest allows pass the test suite.
 - The crate follows semantic versioning. Before 1.0, a breaking change bumps the minor version;
   see the [changelog](CHANGELOG.md).
 

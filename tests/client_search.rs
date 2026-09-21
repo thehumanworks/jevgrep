@@ -101,6 +101,57 @@ fn filter_questions_are_positive_atomic_and_outside_state() {
     assert_eq!(keys(&qs), HashSet::from(["F0.S", "q0.rel"])); // files-only: section level only
 }
 
+/// The Jev client is typed and `jg`'s backends share a JSON contract, so every request is read
+/// into the client's types and written out again. What is written must be, byte for byte, the
+/// document `jg` built: the wording and the order of the questions are behaviour.
+#[test]
+fn the_typed_client_sends_exactly_the_json_that_jg_built() {
+    use jevgrep::backend::DecisionBackend;
+    let chunk =
+        &chunk_lines("src/a.py", &["import os", "", "def f():", "    return os.getcwd()", "", "print(f())"], Chunking::default())[0];
+    let rules = parse_filter("source code only. no tests");
+    let triage = (
+        json!({"task": "pick files", "query": "where is cwd read", "paths": {"p0": "src/a.py", "p1": "docs/b.md"}}),
+        json!({"p0": {"type": "noul", "instructions": "Is `p0` likely to hold it?"}, "p1": {"type": "noul", "instructions": "Is `p1` likely to hold it?"}})
+            .as_object()
+            .unwrap()
+            .clone(),
+    );
+    let requests = [
+        build_request(&queries(&["where is cwd read"]), chunk, false, false, None),
+        build_request(&queries(&["where is cwd read", "what is printed"]), chunk, true, true, Some(&rules)),
+        triage,
+    ];
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let log = Arc::clone(&sent);
+    let transport = move |raw: &[u8]| {
+        log.lock().unwrap().push(String::from_utf8(raw.to_vec()).unwrap());
+        let body: Value = serde_json::from_slice(raw).unwrap();
+        let answers: Map<String, Value> = body["questions"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(id, q)| match q["type"].as_str() {
+                Some("score") => (id.clone(), json!({"type": "score", "score": 1.0, "confidence": 0.5, "probabilities": {}, "legend": {}})),
+                _ => (id.clone(), json!({"type": "noul", "noul": 0.5})),
+            })
+            .collect();
+        ok(json!({"model": "jev-test", "answers": answers}).to_string())
+    };
+    let c = JevClient::with_transport(transport, Config::default());
+    for (state, questions) in &requests {
+        assert!(questions.len() > 1);
+        let answers = DecisionBackend::ask(&c, state, questions).unwrap();
+        assert_eq!(answers.keys().collect::<Vec<_>>(), questions.keys().collect::<Vec<_>>(), "one answer per question, in order");
+        assert!(answers.values().all(|a| a["type"] == "noul" || a["type"] == "score"));
+    }
+    let built: Vec<String> = requests
+        .iter()
+        .map(|(state, questions)| serde_json::to_string(&json!({"model": "jev-latest", "state": state, "questions": questions})).unwrap())
+        .collect();
+    assert_eq!(*sent.lock().unwrap(), built);
+}
+
 #[test]
 fn request_question_ids_cover_every_askable_line_block_and_filter_term() {
     let lines = ["import os", "", "def f():", "    return os.getcwd()", "x = 1"];
@@ -225,7 +276,7 @@ fn token_limit_on_single_line_is_an_error_instead_of_empty_success() {
 fn a_search_where_every_request_fails_is_an_error_and_a_partial_one_is_noted() {
     let files = scratch("failing", &[("a.py", "needle = 1\n".into()), ("b.py", "other = 2\n".into())]);
     let c = client(Config::default(), |_| status(422, "nope"));
-    assert!(matches!(search(&c, &queries(&["q"]), &files, &Options::default(), |_, _| {}, |_| {}), Err(DecisionError::Api(_))));
+    assert!(matches!(search(&c, &queries(&["q"]), &files, &Options::default(), |_, _| {}, |_| {}), Err(DecisionError::InvalidRequest(_))));
     let c = client(Config::default(), |body| {
         if body["state"]["file"].as_str().unwrap().ends_with("b.py") {
             status(422, "nope")
@@ -255,7 +306,7 @@ fn path_triage_keeps_likely_files() {
             .iter()
             .map(|(k, v)| (k.clone(), json!({"type": "noul", "noul": if v.as_str().unwrap().contains("auth") { 0.9 } else { 0.01 }})))
             .collect();
-        ok(json!({"answers": answers, "usage": {}}).to_string())
+        ok(json!({"model": "jev-test", "answers": answers, "usage": {}}).to_string())
     });
     let mut notes = Vec::new();
     let res = search(
@@ -286,19 +337,19 @@ fn filter_answers_gate_blocks_lines_and_whole_sections() {
             .map(|(qid, q)| {
                 let text = q["instructions"].as_str().unwrap();
                 let answer = if q["type"] == "score" {
-                    json!({"type": "score", "score": 3.0, "confidence": 0.9})
+                    json!({"type": "score", "score": 3.0, "confidence": 0.9, "probabilities": {}, "legend": {}})
                 } else if qid.starts_with('F') && text.contains("documentation") {
-                    json!({"noul": if path.ends_with(".md") { 0.97 } else { 0.03 }})
+                    json!({"type": "noul", "noul": if path.ends_with(".md") { 0.97 } else { 0.03 }})
                 } else if qid.starts_with('F') {
                     let hit = common::block_range(qid).is_some_and(|(lo, hi)| (lo..=hi).any(|n| code[&n].starts_with("import")));
-                    json!({"noul": if hit { 0.95 } else { 0.04 }})
+                    json!({"type": "noul", "noul": if hit { 0.95 } else { 0.04 }})
                 } else {
-                    json!({"noul": 0.9})
+                    json!({"type": "noul", "noul": 0.9})
                 };
                 (qid.clone(), answer)
             })
             .collect();
-        ok(json!({"answers": answers}).to_string())
+        ok(json!({"model": "jev-test", "answers": answers}).to_string())
     });
     let opts = Options { rules: Some(parse_filter("no imports, no documentation")), ..Options::default() };
     let res = search(&c, &queries(&["anything"]), &files, &opts, |_, _| {}, |_| {}).unwrap();
