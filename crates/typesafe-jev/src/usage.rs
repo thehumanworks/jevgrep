@@ -1,8 +1,6 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use serde_json::Value;
-
-use crate::USD_PER_INPUT_MTOK;
+use crate::{TokenUsage, USD_PER_INPUT_MTOK};
 
 /// Thread-safe request and token counters.
 ///
@@ -34,11 +32,9 @@ impl Usage {
         self.retries.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// One completed request, from the reply's `usage` object (`input_tokens` and
-    /// `output_tokens`; a missing or malformed field counts as zero).
-    pub(crate) fn record_reported(&self, usage: Option<&Value>) {
-        let field = |k: &str| usage.and_then(|u| u.get(k)).and_then(Value::as_u64).unwrap_or(0);
-        self.record(field("input_tokens"), field("output_tokens"));
+    /// One completed request, from the reply's `usage`. A count the API left out is zero.
+    pub(crate) fn record_reported(&self, usage: TokenUsage) {
+        self.record(usage.input_tokens.unwrap_or(0), usage.output_tokens.unwrap_or(0));
     }
 
     /// Requests that were answered.
@@ -71,7 +67,6 @@ impl Usage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     #[test]
     fn counts_requests_retries_and_tokens() {
@@ -79,9 +74,10 @@ mod tests {
         assert_eq!((usage.requests(), usage.retries(), usage.input_tokens(), usage.output_tokens()), (0, 0, 0, 0));
         usage.record(100, 10);
         usage.record_retry();
-        usage.record_reported(Some(&json!({"input_tokens": 50, "output_tokens": 5})));
-        usage.record_reported(Some(&json!({"input_tokens": "not a number"})));
-        usage.record_reported(None);
+        let reported = |text: &str| serde_json::from_str::<TokenUsage>(text).unwrap();
+        usage.record_reported(reported(r#"{"input_tokens": 50, "output_tokens": 5}"#));
+        usage.record_reported(reported(r#"{"output_tokens": null}"#));
+        usage.record_reported(TokenUsage::default());
         assert_eq!((usage.requests(), usage.retries(), usage.input_tokens(), usage.output_tokens()), (4, 1, 150, 15));
         assert!((usage.cost_usd() - 150.0 / 1_000_000.0 * USD_PER_INPUT_MTOK).abs() < 1e-15);
     }

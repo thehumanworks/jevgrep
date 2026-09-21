@@ -16,6 +16,10 @@ pub enum Error {
     /// The request exceeded the model's context (`max_tokens_exceeded`, or HTTP 413). Ask fewer
     /// questions, or about less state, and retry.
     TokenLimit(String),
+    /// A request the API would not evaluate: a state that does not serialize to JSON, or a body
+    /// the API refused as malformed (HTTP 422), such as a [`Score`](crate::Score) with a single
+    /// level or a state that is a bare number. The message quotes what the API objected to.
+    InvalidRequest(String),
     /// A [`Config`](crate::Config) no request could be sent with: a base URL that is not an
     /// absolute `http` or `https` URL, or a user agent that is not a valid header value.
     /// Reported by [`Client::new`](crate::Client::new), before anything is sent.
@@ -27,7 +31,7 @@ pub enum Error {
 impl Error {
     /// The message, without the variant.
     pub fn message(&self) -> &str {
-        let (Error::Auth(m) | Error::TokenLimit(m) | Error::InvalidConfig(m) | Error::Api(m)) = self;
+        let (Error::Auth(m) | Error::TokenLimit(m) | Error::InvalidRequest(m) | Error::InvalidConfig(m) | Error::Api(m)) = self;
         m
     }
 }

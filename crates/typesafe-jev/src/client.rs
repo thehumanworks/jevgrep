@@ -1,11 +1,11 @@
 use std::fmt;
 use std::time::Duration;
 
-use serde_json::{json, Map, Value};
+use serde::Serialize;
 
 use crate::limiter::{jitter, AdaptiveLimiter};
 use crate::transport::{Http, Transport};
-use crate::{Error, Usage, API_KEY_VAR, DEFAULT_BASE_URL, DEFAULT_MODEL};
+use crate::{Error, Questions, Response, Usage, API_KEY_VAR, DEFAULT_BASE_URL, DEFAULT_MODEL};
 
 /// Statuses worth another attempt: timeouts, conflicts, throttling and server-side trouble.
 const RETRYABLE: &[u16] = &[408, 409, 425, 429, 500, 502, 503, 504, 529];
@@ -160,14 +160,12 @@ impl Client {
         }
     }
 
-    /// Evaluates `questions` against `state` and returns the `answers` map, keyed like the
-    /// questions.
+    /// Evaluates `questions` against `state` and returns the [`Response`]: one
+    /// [`Answer`](crate::Answer) per question, under the id the question had.
     ///
-    /// `state` is any JSON the questions refer to. Each question is an object with a `type`
-    /// (`noul` or `score`) and `instructions`; a `score` question also lists its `criteria`. Each
-    /// answer is an object with the same `type` and the model's judgment: a `noul` probability in
-    /// [0, 1], or a `score` with its `confidence` and `probabilities`. The crate documentation
-    /// shows both shapes.
+    /// `state` is what the questions are about, and anything that serializes to a JSON string,
+    /// object or array: a `&str`, a `serde_json::Value`, or a type of your own that derives
+    /// `Serialize`. Jev reads text only. A question can name a field of the state in backticks.
     ///
     /// Transient failures are retried with exponential backoff up to [`Config::max_retries`]
     /// times, honouring `Retry-After` (capped at 30 seconds) and the shared [`AdaptiveLimiter`].
@@ -176,13 +174,19 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// [`Error::Auth`] for HTTP 401 and 403, and [`Error::TokenLimit`] for a request larger than
-    /// the model's context, both without a retry. [`Error::Api`] for any other status that is not
-    /// worth retrying, for a reply that is not the documented JSON, and once the retries are
-    /// spent; the message then ends with the last failure.
-    pub fn ask(&self, state: &Value, questions: &Map<String, Value>) -> Result<Map<String, Value>, Error> {
-        let body = serde_json::to_vec(&json!({"model": self.model, "state": state, "questions": questions}))
-            .map_err(|e| Error::Api(e.to_string()))?;
+    /// [`Error::Auth`] for HTTP 401 and 403, [`Error::TokenLimit`] for a request larger than the
+    /// model's context, and [`Error::InvalidRequest`] for a state that does not serialize or a
+    /// body the API refuses as malformed (HTTP 422), all without a retry. [`Error::Api`] for any
+    /// other status that is not worth retrying, for a reply that is not the documented JSON, and
+    /// once the retries are spent; the message then ends with the last failure.
+    pub fn ask<S: Serialize + ?Sized>(&self, state: &S, questions: &Questions) -> Result<Response, Error> {
+        let request = Request { model: &self.model, state, questions };
+        let body = serde_json::to_vec(&request).map_err(|e| Error::InvalidRequest(format!("the state does not serialize to JSON: {e}")))?;
+        self.send(&body)
+    }
+
+    /// The part of [`ask`](Client::ask) that does not depend on the type of the state.
+    fn send(&self, body: &[u8]) -> Result<Response, Error> {
         let mut last = String::from("unknown error");
         for attempt in 0..=self.max_retries {
             if attempt > 0 {
@@ -192,7 +196,7 @@ impl Client {
             }
             let sent = {
                 let mut slot = Slot::acquire(&self.limiter);
-                let sent = self.transport.post(&body);
+                let sent = self.transport.post(body);
                 slot.throttled = matches!(&sent, Ok(r) if r.status == 429 || r.status == 529);
                 sent
             };
@@ -205,12 +209,9 @@ impl Client {
                 }
             };
             if reply.status == 200 {
-                let mut data: Value = serde_json::from_str(&reply.body).map_err(|e| Error::Api(format!("unreadable response: {e}")))?;
-                self.usage.record_reported(data.get("usage"));
-                return match data.get_mut("answers").map(Value::take) {
-                    Some(Value::Object(answers)) => Ok(answers),
-                    _ => Err(Error::Api("response has no `answers` object".into())),
-                };
+                let response: Response = serde_json::from_str(&reply.body).map_err(|e| Error::Api(format!("unreadable response: {e}")))?;
+                self.usage.record_reported(response.usage);
+                return Ok(response);
             }
             let text: String = reply.body.chars().take(400).collect();
             if reply.status == 401 || reply.status == 403 {
@@ -218,6 +219,9 @@ impl Client {
             }
             if text.contains("max_tokens_exceeded") || reply.status == 413 {
                 return Err(Error::TokenLimit(text));
+            }
+            if reply.status == 422 {
+                return Err(Error::InvalidRequest(format!("HTTP 422: {text}")));
             }
             if RETRYABLE.contains(&reply.status) {
                 last = format!("HTTP {}: {text}", reply.status);
@@ -231,6 +235,14 @@ impl Client {
         }
         Err(Error::Api(format!("gave up after {} retries: {last}", self.max_retries)))
     }
+}
+
+/// The request body. The field order is the order on the wire.
+#[derive(Serialize)]
+struct Request<'a, S: ?Sized> {
+    model: &'a str,
+    state: &'a S,
+    questions: &'a Questions,
 }
 
 /// The model, the retry policy and the counters. The transport is left out: it holds the key.

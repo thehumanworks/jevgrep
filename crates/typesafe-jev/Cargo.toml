@@ -1,9 +1,9 @@
 [package]
 name = "typesafe-jev"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.85"
-description = "Client for TypeSafe's System One API and its Jev model: calibrated answers to typed questions about JSON state, with retries, adaptive concurrency and usage accounting"
+description = "Typed client for TypeSafe's System One API and its Jev model: calibrated Noul, Choice and Score answers about JSON state, with retries, adaptive concurrency and usage accounting"
 readme = "README.md"
 repository = "https://github.com/thehumanworks/jevgrep"
 homepage = "https://github.com/thehumanworks/jevgrep/tree/main/crates/typesafe-jev"
@@ -14,7 +14,9 @@ categories = ["api-bindings", "web-programming::http-client"]
 include = ["/src", "/tests", "/examples", "/README.md", "/CHANGELOG.md", "/LICENSE-*"]
 
 [dependencies]
-# Both floors are tested: the crate's suite passes on exactly these versions.
+# The floors are tested: the crate's suite passes on exactly these versions.
+indexmap = { version = "2.0.0", features = ["serde"] }
+serde = { version = "1.0.130", features = ["derive"] }
 serde_json = "1.0.45"
 ureq = { version = "3.0.0", default-features = false, features = ["rustls", "gzip"] }
 

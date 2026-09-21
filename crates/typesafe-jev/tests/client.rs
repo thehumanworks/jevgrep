@@ -4,8 +4,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use serde_json::{json, Map, Value};
-use typesafe_jev::{Client, Config, Error, Reply, Transport};
+use serde_json::{json, Value};
+use typesafe_jev::{Answer, Choice, Client, Config, Error, Noul, Questions, Reply, Score, Transport};
 
 fn ok(body: impl Into<String>) -> Result<Reply, String> {
     Ok(Reply { status: 200, retry_after: None, body: body.into() })
@@ -24,11 +24,24 @@ fn client(cfg: Config, handler: impl Fn(&Value) -> Result<Reply, String> + Send 
     Client::with_transport(transport, instant(cfg))
 }
 
-fn questions() -> Map<String, Value> {
-    let mut qs = Map::new();
-    qs.insert("hit".into(), json!({"type": "noul", "instructions": "Does the code read a file?"}));
-    qs.insert("rel".into(), json!({"type": "score", "instructions": "How relevant?", "criteria": ["no", "somewhat", "yes"]}));
-    qs
+fn questions() -> Questions {
+    Questions::new()
+        .with("hit", Noul::new("Does the code read a file?"))
+        .with("rel", Score::new("How relevant?", ["no", "somewhat", "yes"]))
+        .with("kind", Choice::new("What does the code do?", [("io", "Reads or writes files"), ("math", "Computes")]).label("other"))
+}
+
+/// The same questions, as the API reference spells them.
+fn questions_on_the_wire() -> Value {
+    json!({
+        "hit": {"type": "noul", "instructions": "Does the code read a file?"},
+        "rel": {"type": "score", "instructions": "How relevant?", "criteria": ["no", "somewhat", "yes"]},
+        "kind": {
+            "type": "choice",
+            "instructions": "What does the code do?",
+            "criteria": {"io": "Reads or writes files", "math": "Computes", "other": null},
+        },
+    })
 }
 
 fn answers() -> String {
@@ -36,7 +49,14 @@ fn answers() -> String {
         "model": "jev-test",
         "answers": {
             "hit": {"type": "noul", "noul": 0.95},
-            "rel": {"type": "score", "score": 1.5, "confidence": 0.8, "probabilities": {}, "legend": {}},
+            "rel": {
+                "type": "score",
+                "score": 1.5,
+                "confidence": 0.8,
+                "legend": {"0": "no", "1": "somewhat", "2": "yes"},
+                "probabilities": {"0": 0.0, "1": 0.5, "2": 0.5},
+            },
+            "kind": {"type": "choice", "choice": "io", "confidence": 0.9, "probabilities": {"io": 0.95, "math": 0.05, "other": 0.0}},
         },
         "usage": {"input_tokens": 120, "output_tokens": 7},
     })
@@ -52,13 +72,19 @@ fn sends_model_state_and_questions_and_returns_the_answers() {
         ok(answers())
     });
     let got = c.ask(&json!({"code": "open('x')"}), &questions()).unwrap();
-    assert_eq!(got["hit"]["noul"], 0.95);
-    assert_eq!(got["rel"]["score"], 1.5);
+    assert_eq!(got.model, "jev-test");
+    assert_eq!(got.noul("hit").unwrap().noul, 0.95);
+    let rel = got.score("rel").unwrap();
+    assert_eq!((rel.score, rel.confidence, rel.probabilities[&2], rel.legend[&1].as_str()), (1.5, 0.8, 0.5, Some("somewhat")));
+    let kind = got.choice("kind").unwrap();
+    assert_eq!((kind.choice.as_str(), kind.confidence, kind.probabilities["math"]), ("io", 0.9, 0.05));
+    assert!(got.choice("hit").is_none() && got.noul("absent").is_none() && matches!(got.answers["hit"], Answer::Noul(_)));
+    assert_eq!((got.usage.input_tokens, got.usage.output_tokens), (Some(120), Some(7)));
     let sent = seen.lock().unwrap();
     assert_eq!(sent.len(), 1);
     assert_eq!(sent[0]["model"], "jev-2");
     assert_eq!(sent[0]["state"], json!({"code": "open('x')"}));
-    assert_eq!(sent[0]["questions"], Value::Object(questions()));
+    assert_eq!(sent[0]["questions"], questions_on_the_wire());
     assert_eq!(sent[0].as_object().unwrap().len(), 3, "nothing but model, state and questions is sent");
     assert_eq!(c.model(), "jev-2");
     assert_eq!((c.usage().requests(), c.usage().retries(), c.usage().input_tokens(), c.usage().output_tokens()), (1, 0, 120, 7));
@@ -66,13 +92,73 @@ fn sends_model_state_and_questions_and_returns_the_answers() {
 
 #[test]
 fn a_reply_without_answers_or_without_json_is_an_api_error() {
-    let c = client(Config::default(), |_| ok("{\"model\": \"jev\"}"));
-    assert_eq!(c.ask(&json!({}), &questions()), Err(Error::Api("response has no `answers` object".into())));
-    let c = client(Config::default(), |_| ok("{\"answers\": []}"));
-    assert!(matches!(c.ask(&json!({}), &questions()), Err(Error::Api(m)) if m.contains("no `answers` object")));
-    let c = client(Config::default(), |_| ok("<html>maintenance</html>"));
-    assert!(matches!(c.ask(&json!({}), &questions()), Err(Error::Api(m)) if m.starts_with("unreadable response")));
-    assert_eq!(c.usage().requests(), 0, "a failed request is not counted as answered");
+    for (reply, reason) in [
+        (r#"{"model": "jev"}"#, "missing field `answers`"),
+        (r#"{"answers": {}}"#, "missing field `model`"),
+        (r#"{"model": "jev", "answers": []}"#, "expected a map"),
+        (r#"{"model": "jev", "answers": {"q": {"type": "noul"}}}"#, "a `noul` answer has no `noul`"),
+        (r#"{"model": "jev", "answers": {"q": {"type": "noul", "noul": "high"}}}"#, "expected f64"),
+        (
+            r#"{"model": "jev", "answers": {"q": {"type": "choice", "choice": "a", "confidence": 1.0}}}"#,
+            "a `choice` answer has no `probabilities`",
+        ),
+        (
+            r#"{"model": "jev", "answers": {"q": {"type": "score", "score": 1.0, "confidence": 1.0, "legend": {}, "probabilities": {"low": 1.0}}}}"#,
+            "`probabilities` has the key `low`, which is not a level number",
+        ),
+        (r#"{"model": "jev", "answers": {"q": {"type": "ranking", "ranking": []}}}"#, "unknown answer type `ranking`"),
+        ("<html>maintenance</html>", "expected value"),
+    ] {
+        let c = client(Config::default(), move |_| ok(reply));
+        let err = c.ask(&json!({}), &questions()).unwrap_err();
+        assert!(matches!(&err, Error::Api(m) if m.starts_with("unreadable response: ") && m.contains(reason)), "{reply} -> {err:?}");
+        assert_eq!(c.usage().requests(), 0, "a failed request is not counted as answered");
+    }
+}
+
+#[test]
+fn fields_this_version_does_not_know_are_ignored_and_absent_token_counts_are_none() {
+    let c = client(Config::default(), |_| {
+        ok(
+            r#"{"model": "jev-9", "request": "r-1", "answers": {"q": {"type": "noul", "noul": 0.25, "calibration": "v2"}}, "usage": {"cached_tokens": 3}}"#,
+        )
+    });
+    let got = c.ask("plain text state", &Questions::new().with("q", Noul::new("?"))).unwrap();
+    assert_eq!((got.noul("q").unwrap().noul, got.usage.input_tokens, got.usage.output_tokens), (0.25, None, None));
+    let c = client(Config::default(), |_| ok(r#"{"model": "jev-9", "answers": {}}"#));
+    assert_eq!(c.ask("", &Questions::new()).unwrap().usage, typesafe_jev::TokenUsage::default());
+    assert_eq!((c.usage().requests(), c.usage().input_tokens()), (1, 0));
+}
+
+#[test]
+fn the_state_is_anything_that_serializes_and_is_sent_as_it_serializes() {
+    #[derive(serde::Serialize)]
+    struct Ticket<'a> {
+        subject: &'a str,
+        messages: Vec<&'a str>,
+    }
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let log = Arc::clone(&seen);
+    let c = client(Config::default(), move |body| {
+        log.lock().unwrap().push(body["state"].clone());
+        ok(answers())
+    });
+    let qs = questions();
+    c.ask("Help! My payouts have been failing for 3 days.", &qs).unwrap();
+    c.ask(&Ticket { subject: "payouts", messages: vec!["failing", "3 days"] }, &qs).unwrap();
+    c.ask(&["first message", "second message"], &qs).unwrap();
+    assert_eq!(
+        *seen.lock().unwrap(),
+        [
+            json!("Help! My payouts have been failing for 3 days."),
+            json!({"subject": "payouts", "messages": ["failing", "3 days"]}),
+            json!(["first message", "second message"]),
+        ]
+    );
+    let unserializable = std::collections::BTreeMap::from([((1, 2), "a tuple is not a JSON key")]);
+    let err = c.ask(&unserializable, &qs).unwrap_err();
+    assert!(matches!(&err, Error::InvalidRequest(m) if m.starts_with("the state does not serialize")), "{err:?}");
+    assert_eq!(seen.lock().unwrap().len(), 3, "nothing was sent for it");
 }
 
 #[test]
@@ -85,7 +171,7 @@ fn retries_transient_statuses_and_connection_failures_then_succeeds() {
         2 => Ok(Reply { status: 429, retry_after: Some("0".into()), body: "slow down".into() }),
         _ => ok(answers()),
     });
-    assert_eq!(c.ask(&json!({}), &questions()).unwrap()["hit"]["noul"], 0.95);
+    assert_eq!(c.ask(&json!({}), &questions()).unwrap().noul("hit").unwrap().noul, 0.95);
     assert_eq!(calls.load(Ordering::SeqCst), 4);
     assert_eq!((c.usage().requests(), c.usage().retries()), (1, 3));
 }
@@ -106,7 +192,7 @@ fn every_retryable_status_is_retried_and_others_fail_at_once() {
             "{err:?}"
         );
     }
-    for code in [400u16, 404, 418, 422, 451] {
+    for code in [400u16, 404, 418, 451] {
         let calls = Arc::new(AtomicUsize::new(0));
         let seen = Arc::clone(&calls);
         let c = client(Config::default(), move |_| {
@@ -144,6 +230,20 @@ fn context_overflow_is_a_token_limit_error() {
     let c = client(Config::default(), |_| status(413, "too large"));
     assert_eq!(c.ask(&json!({}), &questions()), Err(Error::TokenLimit("too large".into())));
     assert_eq!(c.usage().retries(), 0);
+}
+
+#[test]
+fn a_body_the_api_refuses_as_malformed_is_an_invalid_request_and_is_not_retried() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&calls);
+    let c = client(Config::default(), move |_| {
+        seen.fetch_add(1, Ordering::SeqCst);
+        status(422, r#"{"detail": [{"loc": ["body", "questions", "rel", "criteria"], "msg": "at least 2 levels"}]}"#)
+    });
+    let one_level = Questions::new().with("rel", Score::new("How relevant?", ["only"]));
+    let err = c.ask(&json!({}), &one_level).unwrap_err();
+    assert!(matches!(&err, Error::InvalidRequest(m) if m.starts_with("HTTP 422: ") && m.contains("at least 2 levels")), "{err:?}");
+    assert_eq!((calls.load(Ordering::SeqCst), c.usage().retries()), (1, 0));
 }
 
 #[test]
@@ -199,7 +299,7 @@ fn concurrent_asks_share_the_pool_and_the_usage() {
     let workers: Vec<_> = (0..12)
         .map(|_| {
             let c = Arc::clone(&c);
-            std::thread::spawn(move || c.ask(&json!({}), &questions()).unwrap()["hit"]["noul"].as_f64().unwrap())
+            std::thread::spawn(move || c.ask(&json!({}), &questions()).unwrap().noul("hit").unwrap().noul)
         })
         .collect();
     for worker in workers {
@@ -213,7 +313,7 @@ fn concurrent_asks_share_the_pool_and_the_usage() {
 fn a_boxed_transport_is_a_transport() {
     let boxed: Box<dyn Transport> = Box::new(|_: &[u8]| ok(answers()));
     let c = Client::with_transport(boxed, Config::default());
-    assert_eq!(c.ask(&json!({}), &questions()).unwrap()["hit"]["noul"], 0.95);
+    assert_eq!(c.ask(&json!({}), &questions()).unwrap().noul("hit").unwrap().noul, 0.95);
 }
 
 #[test]
@@ -237,7 +337,7 @@ fn a_panicking_transport_gives_its_slot_back() {
     let doomed = Arc::clone(&c);
     assert!(std::thread::spawn(move || doomed.ask(&json!({}), &questions())).join().is_err());
     assert_eq!(c.limiter().in_flight(), 0);
-    assert_eq!(c.ask(&json!({}), &questions()).unwrap()["hit"]["noul"], 0.95, "the only slot is free again");
+    assert_eq!(c.ask(&json!({}), &questions()).unwrap().noul("hit").unwrap().noul, 0.95, "the only slot is free again");
 }
 
 #[test]
@@ -264,7 +364,13 @@ fn senseless_backoff_settings_mean_no_wait_rather_than_a_panic() {
 
 #[test]
 fn errors_are_open_to_new_variants_and_every_variant_has_a_message() {
-    for err in [Error::Auth("m".into()), Error::TokenLimit("m".into()), Error::InvalidConfig("m".into()), Error::Api("m".into())] {
+    for err in [
+        Error::Auth("m".into()),
+        Error::TokenLimit("m".into()),
+        Error::InvalidRequest("m".into()),
+        Error::InvalidConfig("m".into()),
+        Error::Api("m".into()),
+    ] {
         assert_eq!((err.message(), err.to_string().as_str()), ("m", "m"));
     }
 }
