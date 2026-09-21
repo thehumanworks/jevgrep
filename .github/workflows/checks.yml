@@ -32,6 +32,26 @@ jobs:
       - name: Required local and CI checks
         run: scripts/check.sh
 
+  crate:
+    name: typesafe-jev (MSRV and package)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1; Node 24
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0; Node 24
+        with:
+          python-version: '3.12'
+      - name: Install the crate's minimum supported Rust
+        shell: bash
+        run: |
+          set -euo pipefail
+          msrv=$(python3 -c 'import sys, tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["package"]["rust-version"])' crates/typesafe-jev/Cargo.toml)
+          rustup toolchain install "$msrv" --profile minimal
+      - name: Tests on the MSRV and a build from the package alone
+        run: scripts/check.sh crate
+
   native:
     name: native (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
@@ -107,7 +127,7 @@ jobs:
   required:
     name: required checks
     if: always()
-    needs: [quality, native]
+    needs: [quality, native, crate]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -115,4 +135,5 @@ jobs:
         env:
           QUALITY: ${{ needs.quality.result }}
           NATIVE: ${{ needs.native.result }}
-        run: test "$QUALITY" = success && test "$NATIVE" = success
+          CRATE: ${{ needs.crate.result }}
+        run: test "$QUALITY" = success && test "$NATIVE" = success && test "$CRATE" = success

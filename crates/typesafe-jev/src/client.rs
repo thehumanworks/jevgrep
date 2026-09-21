@@ -1,3 +1,4 @@
+use std::fmt;
 use std::time::Duration;
 
 use serde_json::{json, Map, Value};
@@ -30,9 +31,9 @@ pub struct Config {
     pub timeout: Duration,
     /// Attempts after the first for transient failures; see [`Error`] for what is transient.
     pub max_retries: u32,
-    /// The longest a retry's exponential backoff grows to, in seconds. Starts at half a second
-    /// and doubles per attempt, times a random factor in [0.5, 1.5).
-    pub max_backoff: f64,
+    /// The longest a retry's exponential backoff grows to. The backoff starts at half a second
+    /// and doubles per attempt, up to this cap, times a random factor in [0.5, 1.5).
+    pub max_backoff: Duration,
     /// Connections kept open, and the ceiling of the concurrency [`AdaptiveLimiter`]. Set it to
     /// the number of threads that will call [`Client::ask`] at once.
     pub pool_size: usize,
@@ -40,7 +41,8 @@ pub struct Config {
     /// attempt, times a random factor in [1, 2).
     pub throttle_pause: Duration,
     /// Multiplies the retry backoff and any `Retry-After` wait. Zero makes retries immediate,
-    /// which tests want; [`Config::throttle_pause`] is separate.
+    /// which tests want; [`Config::throttle_pause`] is separate. A negative or non-finite scale
+    /// also means no wait.
     pub backoff_scale: f64,
 }
 
@@ -54,7 +56,7 @@ impl Default for Config {
             connect_timeout: Duration::from_secs(15),
             timeout: Duration::from_secs(60),
             max_retries: 8,
-            max_backoff: 30.0,
+            max_backoff: Duration::from_secs(30),
             pool_size: 64,
             throttle_pause: Duration::from_secs(1),
             backoff_scale: 1.0,
@@ -70,7 +72,7 @@ pub struct Client {
     model: String,
     provider: String,
     max_retries: u32,
-    max_backoff: f64,
+    max_backoff: Duration,
     backoff_scale: f64,
     usage: Usage,
     limiter: AdaptiveLimiter,
@@ -80,18 +82,30 @@ pub struct Client {
 
 impl Client {
     /// A client that sends `api_key` as a bearer token to [`Config::base_url`] over HTTPS.
+    /// Whitespace around the key, such as the newline at the end of a key file, is dropped.
     ///
-    /// Nothing is sent until the first [`ask`](Client::ask): a bad key is reported then, as
-    /// [`Error::Auth`].
-    pub fn new(api_key: &str, cfg: Config) -> Self {
-        let http = Http::new(api_key, &cfg);
-        Self::with_transport(http, cfg)
+    /// Nothing is sent until the first [`ask`](Client::ask): a key the API rejects is reported
+    /// then, as [`Error::Auth`].
+    ///
+    /// # Errors
+    ///
+    /// What no request could be sent with is reported here rather than retried later:
+    /// [`Error::Auth`] for a blank key or one that cannot go in a header, and
+    /// [`Error::InvalidConfig`] for a [`Config::base_url`] that is not an absolute `http` or
+    /// `https` URL or a [`Config::user_agent`] that is not a valid header value.
+    pub fn new(api_key: &str, cfg: Config) -> Result<Self, Error> {
+        let http = Http::new(api_key, &cfg)?;
+        Ok(Self::with_transport(http, cfg))
     }
 
     /// A client that reads its API key from the [`API_KEY_VAR`] environment variable.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Auth`] if the variable is unset or blank; otherwise as [`Client::new`].
     pub fn from_env(cfg: Config) -> Result<Self, Error> {
         let key = api_key_from(std::env::var(API_KEY_VAR).ok().as_deref())?;
-        Ok(Self::new(&key, cfg))
+        Self::new(&key, cfg)
     }
 
     /// A client over any [`Transport`], for tests and local fakes. [`Config::base_url`],
@@ -138,10 +152,11 @@ impl Client {
         }
     }
 
+    /// A product that is negative, NaN or too large for a `Duration` is no wait, not a panic.
     fn sleep(&self, seconds: f64) {
-        let seconds = seconds * self.backoff_scale;
-        if seconds > 0.0 {
-            std::thread::sleep(Duration::from_secs_f64(seconds));
+        match Duration::try_from_secs_f64(seconds * self.backoff_scale) {
+            Ok(wait) if !wait.is_zero() => std::thread::sleep(wait),
+            _ => {}
         }
     }
 
@@ -156,7 +171,15 @@ impl Client {
     ///
     /// Transient failures are retried with exponential backoff up to [`Config::max_retries`]
     /// times, honouring `Retry-After` (capped at 30 seconds) and the shared [`AdaptiveLimiter`].
+    /// A `Retry-After` given as a date rather than as seconds is ignored in favour of the backoff.
     /// The call blocks the calling thread; run it from a thread pool for concurrency.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Auth`] for HTTP 401 and 403, and [`Error::TokenLimit`] for a request larger than
+    /// the model's context, both without a retry. [`Error::Api`] for any other status that is not
+    /// worth retrying, for a reply that is not the documented JSON, and once the retries are
+    /// spent; the message then ends with the last failure.
     pub fn ask(&self, state: &Value, questions: &Map<String, Value>) -> Result<Map<String, Value>, Error> {
         let body = serde_json::to_vec(&json!({"model": self.model, "state": state, "questions": questions}))
             .map_err(|e| Error::Api(e.to_string()))?;
@@ -164,11 +187,15 @@ impl Client {
         for attempt in 0..=self.max_retries {
             if attempt > 0 {
                 self.usage.record_retry();
-                self.sleep((0.5 * 2f64.powi(attempt as i32 - 1)).min(self.max_backoff) * (0.5 + jitter()));
+                let doublings = (attempt - 1).min(32) as i32;
+                self.sleep((0.5 * 2f64.powi(doublings)).min(self.max_backoff.as_secs_f64()) * (0.5 + jitter()));
             }
-            self.limiter.acquire();
-            let sent = self.transport.post(&body);
-            self.limiter.release(matches!(&sent, Ok(r) if r.status == 429 || r.status == 529));
+            let sent = {
+                let mut slot = Slot::acquire(&self.limiter);
+                let sent = self.transport.post(&body);
+                slot.throttled = matches!(&sent, Ok(r) if r.status == 429 || r.status == 529);
+                sent
+            };
             let reply = match sent {
                 Ok(reply) => reply,
                 Err(e) => {
@@ -206,6 +233,41 @@ impl Client {
     }
 }
 
+/// The model, the retry policy and the counters. The transport is left out: it holds the key.
+impl fmt::Debug for Client {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Client")
+            .field("model", &self.model)
+            .field("provider", &self.provider)
+            .field("max_retries", &self.max_retries)
+            .field("max_backoff", &self.max_backoff)
+            .field("backoff_scale", &self.backoff_scale)
+            .field("usage", &self.usage)
+            .field("limiter", &self.limiter)
+            .finish_non_exhaustive()
+    }
+}
+
+/// One slot of the limiter, given back when dropped: a transport that panics must not leak it,
+/// or the threads that are left would wait for a slot that never frees.
+struct Slot<'a> {
+    limiter: &'a AdaptiveLimiter,
+    throttled: bool,
+}
+
+impl<'a> Slot<'a> {
+    fn acquire(limiter: &'a AdaptiveLimiter) -> Self {
+        limiter.acquire();
+        Slot { limiter, throttled: false }
+    }
+}
+
+impl Drop for Slot<'_> {
+    fn drop(&mut self) {
+        self.limiter.release(self.throttled);
+    }
+}
+
 /// The key as the environment supplies it: trimmed, and required to be non-blank.
 fn api_key_from(value: Option<&str>) -> Result<String, Error> {
     match value.map(str::trim) {
@@ -232,6 +294,6 @@ mod tests {
         let cfg = Config::default();
         assert_eq!((cfg.base_url.as_str(), cfg.model.as_str(), cfg.provider.as_str()), (DEFAULT_BASE_URL, DEFAULT_MODEL, "TypeSafe"));
         assert!(cfg.user_agent.starts_with("typesafe-jev/"), "{}", cfg.user_agent);
-        assert_eq!((cfg.max_retries, cfg.pool_size, cfg.backoff_scale), (8, 64, 1.0));
+        assert_eq!((cfg.max_retries, cfg.max_backoff, cfg.pool_size, cfg.backoff_scale), (8, Duration::from_secs(30), 64, 1.0));
     }
 }

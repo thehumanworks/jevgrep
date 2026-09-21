@@ -55,7 +55,8 @@
 //! [`Client::ask`] retries connection failures and transient HTTP statuses with exponential
 //! backoff and jitter, honouring `Retry-After`. Rejected credentials come back at once as
 //! [`Error::Auth`]; a request too large for the model's context as [`Error::TokenLimit`], which
-//! the caller should split and retry.
+//! the caller should split and retry. A key or a [`Config`] that no request could be sent with is
+//! reported by [`Client::new`], as [`Error::Auth`] or [`Error::InvalidConfig`], not retried.
 //!
 //! Calls are blocking. The client is `Send + Sync` and shares one connection pool, so call it from
 //! as many threads as [`Config::pool_size`]. An [`AdaptiveLimiter`] caps the concurrency and halves
@@ -82,6 +83,8 @@
 //! let answers = client.ask(&json!({}), &questions).unwrap();
 //! assert_eq!(answers["q"]["noul"], 0.5);
 //! ```
+
+#![warn(missing_docs, missing_debug_implementations)]
 
 mod client;
 mod error;

@@ -474,7 +474,8 @@ class WorkflowTests(unittest.TestCase):
         workflows = ROOT / ".github/workflows"
         shared = (workflows / "checks.yml").read_text()
         self.assertNotIn("concurrency:", shared)
-        self.assertIn("needs: [quality, native]", shared)
+        self.assertIn("needs: [quality, native, crate]", shared)
+        self.assertIn("scripts/check.sh crate", shared)
         self.assertIn("if: always()", shared)
         self.assertIn("scripts/check.sh verify", shared)
         self.assertLess(

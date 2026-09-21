@@ -1,4 +1,6 @@
-use crate::Config;
+use ureq::http::{HeaderValue, Uri};
+
+use crate::{Config, Error};
 
 /// What came back from one HTTP POST, before the client interprets it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,7 +44,26 @@ pub(crate) struct Http {
 }
 
 impl Http {
-    pub(crate) fn new(api_key: &str, cfg: &Config) -> Self {
+    /// Vets everything that would otherwise fail identically on every attempt, so that a typo in
+    /// the configuration is one error at construction instead of a full round of retries.
+    ///
+    /// The messages never quote the key, nor the URL, which may carry credentials of its own.
+    pub(crate) fn new(api_key: &str, cfg: &Config) -> Result<Self, Error> {
+        let api_key = api_key.trim();
+        if api_key.is_empty() {
+            return Err(Error::Auth("the API key is empty".into()));
+        }
+        let auth = format!("Bearer {api_key}");
+        if HeaderValue::from_str(&auth).is_err() {
+            return Err(Error::Auth("the API key has characters that cannot be sent in an HTTP header".into()));
+        }
+        let uri: Uri = cfg.base_url.parse().map_err(|e| Error::InvalidConfig(format!("`Config::base_url` is not a URL: {e}")))?;
+        if !matches!(uri.scheme_str(), Some("http" | "https")) || uri.host().is_none_or(str::is_empty) {
+            return Err(Error::InvalidConfig("`Config::base_url` must be an absolute `https://` (or `http://`) URL".into()));
+        }
+        if HeaderValue::from_str(&cfg.user_agent).is_err() {
+            return Err(Error::InvalidConfig("`Config::user_agent` has characters that cannot be sent in an HTTP header".into()));
+        }
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .http_status_as_error(false)
             .timeout_connect(Some(cfg.connect_timeout))
@@ -54,7 +75,7 @@ impl Http {
             .user_agent(&cfg.user_agent)
             .build()
             .into();
-        Http { agent, url: cfg.base_url.clone(), auth: format!("Bearer {api_key}") }
+        Ok(Http { agent, url: cfg.base_url.clone(), auth })
     }
 }
 
