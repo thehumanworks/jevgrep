@@ -74,6 +74,9 @@ pub fn run(argv: Vec<OsString>) -> i32 {
 }
 
 fn execute(args: &Args, out: &mut dyn Write) -> io::Result<i32> {
+    if args.rules.is_some() {
+        return execute_rules(args, out);
+    }
     if args.queries.is_empty() {
         eprintln!("jg: empty query");
         return Ok(2);
@@ -243,6 +246,48 @@ fn execute(args: &Args, out: &mut dyn Write) -> io::Result<i32> {
     Ok(if any { 0 } else { 1 })
 }
 
+fn execute_rules(args: &Args, out: &mut dyn Write) -> io::Result<i32> {
+    let prepared = crate::rules::prepare(args.rules.as_deref().unwrap(), &args.source, args.check_budget);
+    let mut plan = match prepared {
+        Ok(plan) => plan,
+        Err(error) => {
+            writeln!(out, "{}", serde_json::json!({"schema_version":1,"advisory":true,"status":"error","error":error}))?;
+            return Ok(2);
+        }
+    };
+    if args.plan {
+        writeln!(out, "{}", plan.report("planned", &[], 0, None))?;
+        return Ok(if plan.gaps.is_empty() { 0 } else { 2 });
+    }
+    let progress = Arc::new(Progress::new(false, true, None));
+    let client = if plan.requests.is_empty() {
+        None
+    } else {
+        match build_backend(args, &progress) {
+            Ok(client) => Some(client),
+            Err(_) => {
+                plan.gaps.push(serde_json::json!({"kind":"authentication_or_configuration", "reason":"backend initialization failed; verify selected provider credentials and configuration"}));
+                None
+            }
+        }
+    };
+    let (findings, completed) = client.as_ref().map_or_else(|| (vec![], 0), |client| plan.evaluate(client.as_ref()));
+    let status = if !plan.gaps.is_empty() {
+        "incomplete"
+    } else if findings.is_empty() {
+        "no_findings"
+    } else {
+        "findings"
+    };
+    let usage = client.as_ref().map(|client| serde_json::json!({"requests": client.usage().requests(), "input_tokens": client.usage().input_tokens(), "output_tokens": client.usage().output_tokens(), "reported_cost_usd": client.reported_cost_usd()}));
+    let mut report = plan.report(status, &findings, completed, usage);
+    report["backend"] = serde_json::json!(format!("{:?}", args.backend).to_lowercase());
+    report["model"] = serde_json::json!(args.model);
+    writeln!(out, "{report}")?;
+    // Findings are advisory, never an enforcement gate. Only incomplete execution fails.
+    Ok(if status == "incomplete" { 2 } else { 0 })
+}
+
 /// The `User-Agent` the Jev client keeps sending; the other backends build the same string themselves.
 const USER_AGENT: &str = concat!("jg/", env!("CARGO_PKG_VERSION"));
 
@@ -258,6 +303,7 @@ fn build_backend(args: &Args, progress: &Arc<Progress>) -> Result<Box<dyn Decisi
                 model: args.model.clone(),
                 pool_size: args.jobs.max(8),
                 user_agent: USER_AGENT.into(),
+                max_retries: if args.rules.is_some() { 0 } else { Config::default().max_retries },
                 ..Config::default()
             };
             let mut client = JevClient::new(&key, cfg)?;
@@ -268,7 +314,12 @@ fn build_backend(args: &Args, progress: &Arc<Progress>) -> Result<Box<dyn Decisi
         }
         BackendKind::Chatgpt => {
             let credentials = if args.chatgpt_login { device_login()? } else { resolve_credentials()? };
-            let cfg = ChatGptConfig { base_url: args.base_url.clone(), pool_size: args.jobs, ..ChatGptConfig::default() };
+            let cfg = ChatGptConfig {
+                base_url: args.base_url.clone(),
+                pool_size: args.jobs,
+                max_retries: if args.rules.is_some() { 0 } else { ChatGptConfig::default().max_retries },
+                ..ChatGptConfig::default()
+            };
             let mut client = ChatGptClient::new(&credentials, cfg);
             if debug {
                 client.set_debug_reporter(reporter);
@@ -289,7 +340,7 @@ fn build_backend(args: &Args, progress: &Arc<Progress>) -> Result<Box<dyn Decisi
                     // eighth of small requests and half of large ones whatever the concurrency, so
                     // a retry is soon and often: waiting longer only made one unlucky request the
                     // whole search's tail.
-                    max_retries: 16,
+                    max_retries: if args.rules.is_some() { 0 } else { 16 },
                     max_backoff: Duration::from_secs(2),
                     pool_size: args.jobs.max(8),
                     user_agent: USER_AGENT.into(),
@@ -304,6 +355,7 @@ fn build_backend(args: &Args, progress: &Arc<Progress>) -> Result<Box<dyn Decisi
             let cfg = OpenAiConfig {
                 base_url: args.base_url.clone(),
                 model: args.model.clone(),
+                max_retries: if args.rules.is_some() { 0 } else { OpenAiConfig::default().max_retries },
                 json_schema: !args.no_schema,
                 extra_body: args.extra_body.clone(),
                 pool_size: args.jobs,

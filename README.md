@@ -169,6 +169,69 @@ resolution, or API calls. Key and ChatGPT credential resolution run after a succ
 `jg --help` is the full flag and environment list. Color, progress, and
 flag/environment precedence are documented there.
 
+## Advisory semantic rules (experimental)
+
+Write labelled requirements in `RULES.md`, one per list item:
+
+```markdown
+# Review criteria
+- [READ-PURITY] Functions named as reads or previews must not mutate persistent state.
+- [FAILURE] Failed persistence must remain observable to the caller, not return success.
+```
+
+```sh
+jg --rules RULES.md --source src/store.ts --source src/api.py --plan
+jg --rules RULES.md --source src/store.ts --source src/api.py
+```
+
+`--source` is an exact file, repeatable up to 16 times. No directory traversal,
+implicit repository scan, ignore filtering or triage occurs. Use your changed
+file list to choose sources; whole files are supplied so surrounding behavior is
+available, but findings are **not restricted to changed lines**. Paths with spaces
+need shell quoting. Directories, symlinks, binaries and invalid UTF-8 are refused
+and reported as coverage gaps. Duplicate source files and malformed rule documents
+are errors. Headings and blank lines are allowed; multiline criteria are not yet
+supported. Rules are limited to 16 criteria and 8192 bytes.
+
+`--plan` prints JSON scope and budgets without credentials or network calls.
+Inference uses the existing Jev/ChatGPT/OpenAI backend configuration. It is serial,
+with at most 32 logical requests, 256 KiB of source, and 128 criterion/range
+questions (`--check-budget N`, maximum 1024). Each request's serialized state and
+questions are limited to 64 KiB; provider wrappers/schema add overhead. Ordinary
+transport retries are disabled. The OpenAI adapter may still make up to six HTTP
+attempts per logical request for API/schema/temperature adaptation and malformed
+reply resampling (192 attempts maximum). These bound work, **not dollar cost**;
+pricing and billed tokens depend on the service. API usage is reported when known.
+Search-only tuning flags and nonempty `JG_EXTRA_BODY` request overrides are
+rejected in rules mode.
+
+Blocks and chunks reuse search's splitter, with at most 100 target lines, 24
+preceding and 12 following context lines. Original source is sent without display
+clipping. Large functions can span windows; cross-file semantics remain outside
+this first slice. A chunk that exceeds a budget is explicitly skipped, never
+presented as checked.
+
+The single JSON report includes `status`, explicit `scope`, `coverage`, `limits`,
+`usage`, and `findings`. Every finding carries a criterion, requirement, canonical
+source path, 1-based inclusive range, exact snapshot evidence, score and reason.
+The reason is the **proposition scored by the model**, not an invented causal
+explanation. The model only scores fixed ranges; it cannot invent a location.
+Evidence belongs to the pre-inference snapshot and can differ from a file edited
+while the request runs. A fixed 0.8 threshold is experimental, not validated accuracy.
+
+Statuses are `planned`, `findings`, `no_findings`, `incomplete`, or `error`.
+`no_findings` means all planned decisions on the explicit files completed below
+threshold, not proof of compliance. Missing/malformed answers and provider errors
+are incomplete, as are unreadable files and skipped chunks; valid findings from
+other chunks remain reviewable. Coverage always says `whole_repository: false`.
+Execution errors and incomplete coverage exit 2. Completed checks exit 0 with or
+without findings: this is advisory, makes no fixes, and is not an enforcement gate.
+Existing search exit codes are unchanged.
+
+The [synthetic pilot](bench/rules/README.md) includes labelled TypeScript, Python
+and Rust examples plus negative controls. Live model evaluation has not yet run.
+Deterministic protocol tests do not establish semantic accuracy.
+
 ## Reading the output
 
 Every row has the same shape: location, probability, text.

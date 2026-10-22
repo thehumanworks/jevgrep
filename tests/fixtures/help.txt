@@ -1,13 +1,20 @@
 jevgrep: search code with a natural-language query. Score files, regions and lines with Jev, ChatGPT
 or any OpenAI-compatible model, in parallel.
 
-Usage: jg [OPTIONS] <QUERY> [PATH]...
+Usage: jg [OPTIONS] [QUERY] [PATH]...
 
 Arguments:
-  <QUERY>    What you are looking for, in plain language
+  [QUERY]    What you are looking for, in plain language
   [PATH]...  Files or directories (default: .)
 
 Options:
+      --rules <FILE>          Advisory semantic checks from labelled RULES.md criteria (JSON report)
+      --source <FILE>         Exact source file to check; repeatable, no directory traversal or
+                              implicit discovery
+      --check-budget <N>      Maximum criterion/range decisions for --rules (hard maximum 1024)
+                              [default: 128]
+      --plan                  Print rule-check scope and budgets without resolving credentials or
+                              making requests
   -e, --query <QUERY>         Additional query answered in the same pass (repeatable)
   -l, --files                 Rank relevant files only, no region or line scoring (about 3x cheaper)
   -f, --filter <TEXT>         Plain-language include/exclude rules, e.g. "Source code only. No

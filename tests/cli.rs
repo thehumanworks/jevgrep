@@ -228,7 +228,7 @@ fn usage_errors_help_and_missing_key() {
     assert_eq!((run.code, run.out), (0, format!("jg {}\n", env!("CARGO_PKG_VERSION"))));
     let run = bare(&["-h"]);
     assert!(run.code == 0 && run.err.is_empty());
-    assert!(run.out.contains("Usage: jg [OPTIONS] <QUERY> [PATH]...") && run.out.contains("--filter <TEXT>"));
+    assert!(run.out.contains("Usage: jg [OPTIONS] [QUERY] [PATH]...") && run.out.contains("--filter <TEXT>"));
 }
 
 #[test]

@@ -16,6 +16,8 @@ Decisions describe the implemented contract, not a release announcement.
 | [0010](0010-publishing-typesafe-jev.md) | Accepted | What `typesafe-jev` fixed before 0.1.0 on crates.io: fallible constructor, non-exhaustive errors, panic-free limiter and backoff, MSRV and package gate |
 | [0011](0011-typed-questions-and-answers.md) | Accepted | `typesafe-jev` 0.2: `Noul`, `Choice`, `Score`, their answers and `Response` are Rust types that follow TypeSafe's API reference; replies are read strictly; `jg` converts at its backend boundary, byte for byte |
 
+| [0012](0012-advisory-semantic-rules.md) | Accepted | Bounded, explicitly scoped advisory semantic checks, validated local ranges and honest coverage, with model quality evaluated separately |
+
 ADRs 0001–0003 are dated September 18, 2026; 0004 and 0005 are dated September 19, 2026;
 0006–0008 are dated September 20, 2026; 0009–0011 are dated September 21, 2026. The implementation plan is
 [CLI modernization](../plans/cli-modernization.md). Test and validation commands

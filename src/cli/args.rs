@@ -37,6 +37,10 @@ pub enum ColorMode {
 
 #[derive(Debug)]
 pub struct Args {
+    pub rules: Option<String>,
+    pub source: Vec<String>,
+    pub check_budget: usize,
+    pub plan: bool,
     pub queries: Vec<String>,
     pub paths: Vec<String>,
     pub files: bool,
@@ -180,8 +184,20 @@ OpenAI-compatible scores are estimates. Raise -t for precision, lower it for rec
 )]
 struct CommandLine {
     /// What you are looking for, in plain language
-    #[arg(value_name = "QUERY")]
-    query: String,
+    #[arg(value_name = "QUERY", required_unless_present = "rules")]
+    query: Option<String>,
+    /// Advisory semantic checks from labelled RULES.md criteria (JSON report)
+    #[arg(long, value_name = "FILE", conflicts_with_all = ["query", "paths", "extra", "files", "filter", "only", "exclude_terms", "broad", "glob", "exclude", "triage", "no_heading", "chatgpt_login", "threshold", "file_threshold", "chunk_lines", "max_filesize", "max_files", "context", "top", "max_lines", "max_regions", "hidden", "no_ignore", "jobs", "extra_body"])]
+    rules: Option<String>,
+    /// Exact source file to check; repeatable, no directory traversal or implicit discovery
+    #[arg(long, value_name = "FILE", requires = "rules")]
+    source: Vec<String>,
+    /// Maximum criterion/range decisions for --rules (hard maximum 1024)
+    #[arg(long, default_value_t = 128, value_name = "N", value_parser = positive_usize, requires = "rules")]
+    check_budget: usize,
+    /// Print rule-check scope and budgets without resolving credentials or making requests
+    #[arg(long, requires = "rules")]
+    plan: bool,
     /// Files or directories (default: .)
     #[arg(value_name = "PATH")]
     paths: Vec<String>,
@@ -328,6 +344,9 @@ fn parse_args_with_env(argv: Vec<OsString>, mut env: impl FnMut(&str) -> Option<
         }
         Err(error) => return Err(error.to_string()),
     };
+    if raw.rules.is_some() && (raw.source.is_empty() || raw.source.len() > 16 || raw.check_budget > 1024) {
+        return Err("error: --rules needs 1..=16 explicit --source files and --check-budget <= 1024\n".into());
+    }
     let backend = match raw.backend {
         Some(backend) => backend,
         None => match env("JG_BACKEND").filter(|v| !v.is_empty()) {
@@ -363,11 +382,18 @@ fn parse_args_with_env(argv: Vec<OsString>, mut env: impl FnMut(&str) -> Option<
         Some(text) => parse_extra_body(&text)?,
         None => serde_json::Map::new(),
     };
+    if raw.rules.is_some() && !extra_body.is_empty() {
+        return Err("error: --rules does not allow JG_EXTRA_BODY overrides\n".into());
+    }
     let sdk_url = if raw.base_url.is_none() { openai_env(OPENAI_URL_VAR) } else { None };
     let base_url =
         raw.base_url.unwrap_or_else(|| env("JG_BASE_URL").filter(|v| !v.is_empty()).or(sdk_url).unwrap_or_else(|| default_url.to_owned()));
     Ok(Parsed::Run(Box::new(Args {
-        queries: std::iter::once(raw.query).chain(raw.extra).map(|q| q.trim().to_owned()).filter(|q| !q.is_empty()).collect(),
+        rules: raw.rules,
+        source: raw.source,
+        check_budget: raw.check_budget,
+        plan: raw.plan,
+        queries: raw.query.into_iter().chain(raw.extra).map(|q| q.trim().to_owned()).filter(|q| !q.is_empty()).collect(),
         paths: raw.paths,
         files: raw.files,
         filter: raw.filter,
@@ -473,6 +499,10 @@ mod tests {
         command.build();
         let mut actual: Vec<_> = command.get_arguments().filter_map(|arg| arg.get_long().map(|long| (long, arg.get_short()))).collect();
         let mut expected = vec![
+            ("rules", None),
+            ("source", None),
+            ("check-budget", None),
+            ("plan", None),
             ("query", Some('e')),
             ("files", Some('l')),
             ("filter", Some('f')),
@@ -909,6 +939,15 @@ mod tests {
     }
 
     #[test]
+    fn rules_reject_environment_request_overrides() {
+        let result =
+            parse_args_with_env(argv(&["--rules", "RULES.md", "--source", "a.py", "--backend", "openai", "--model", "m"]), |key| {
+                (key == "JG_EXTRA_BODY").then(|| r#"{"instructions":"override"}"#.into())
+            });
+        assert!(result.unwrap_err().contains("does not allow JG_EXTRA_BODY"));
+    }
+
+    #[test]
     fn help_version_and_errors_never_read_application_environment() {
         for args in [vec!["-h"], vec!["--help"], vec!["-V"], vec!["--version"], vec![], vec!["q", "--jobs=0"], vec!["q", "--bogus"]] {
             let _ = parse_args_with_env(argv(&args), |_| panic!("early exits must not resolve environment"));
@@ -920,7 +959,7 @@ mod tests {
         let short = printed(&["-h"]);
         let long = printed(&["--help"]);
         assert_eq!(short, long);
-        assert!(short.contains("Usage: jg [OPTIONS] <QUERY> [PATH]..."), "{short}");
+        assert!(short.contains("Usage: jg [OPTIONS] [QUERY] [PATH]..."), "{short}");
         for section in ["Arguments:", "Options:", "environment:", "examples:", "filters:", "output, one row shape throughout"] {
             assert!(short.contains(section), "missing {section}");
         }
