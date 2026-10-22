@@ -1,0 +1,122 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "file": "cases/case-109.ts",
+      "expected": [
+        {
+          "criterion": "NAME",
+          "line": 3
+        }
+      ]
+    },
+    {
+      "file": "cases/case-106.ts",
+      "expected": []
+    },
+    {
+      "file": "cases/case-114.ts",
+      "expected": [
+        {
+          "criterion": "RESP",
+          "line": 3
+        }
+      ]
+    },
+    {
+      "file": "cases/case-108.ts",
+      "expected": []
+    },
+    {
+      "file": "cases/case-107.ts",
+      "expected": [
+        {
+          "criterion": "FAIL",
+          "line": 5
+        }
+      ]
+    },
+    {
+      "file": "cases/case-110.ts",
+      "expected": []
+    },
+    {
+      "file": "cases/case-118.py",
+      "expected": [
+        {
+          "criterion": "NAME",
+          "line": 3
+        }
+      ]
+    },
+    {
+      "file": "cases/case-116.py",
+      "expected": []
+    },
+    {
+      "file": "cases/case-112.py",
+      "expected": [
+        {
+          "criterion": "RESP",
+          "line": 5
+        }
+      ]
+    },
+    {
+      "file": "cases/case-102.py",
+      "expected": []
+    },
+    {
+      "file": "cases/case-115.py",
+      "expected": [
+        {
+          "criterion": "FAIL",
+          "line": 5
+        }
+      ]
+    },
+    {
+      "file": "cases/case-104.py",
+      "expected": []
+    },
+    {
+      "file": "cases/case-113.rs",
+      "expected": [
+        {
+          "criterion": "NAME",
+          "line": 3
+        }
+      ]
+    },
+    {
+      "file": "cases/case-103.rs",
+      "expected": []
+    },
+    {
+      "file": "cases/case-105.rs",
+      "expected": [
+        {
+          "criterion": "RESP",
+          "line": 3
+        }
+      ]
+    },
+    {
+      "file": "cases/case-101.rs",
+      "expected": []
+    },
+    {
+      "file": "cases/case-117.rs",
+      "expected": [
+        {
+          "criterion": "FAIL",
+          "line": 3
+        }
+      ]
+    },
+    {
+      "file": "cases/case-111.rs",
+      "expected": []
+    }
+  ]
+}

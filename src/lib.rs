@@ -10,4 +10,5 @@ pub mod filters;
 pub mod jev;
 pub mod openai;
 pub mod results;
+pub mod rules;
 pub mod search;
