@@ -36,6 +36,9 @@ again. Changes that do not alter the binary (docs, tests, CI, this file) need no
 
 ## Working in this repository
 
+- For user-visible changes, add or update a small runnable example when applicable. Show the
+  value, prerequisites, exact invocation and expected behavior; verify the documented commands.
+  Keep provider-free steps usable offline, and label live requirements and unverified results.
 - `scripts/check.sh` is the quality gate CI runs. Where its pinned tools are not installed, run
   its steps by hand: `cargo test`, `cargo clippy --all-targets -- -D warnings`,
   `cargo fmt --check`. Clippy levels live in `Cargo.toml` (ADR 0006).
