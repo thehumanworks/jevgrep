@@ -171,6 +171,9 @@ flag/environment precedence are documented there.
 
 ## Advisory semantic rules (experimental)
 
+Start with the [runnable invoice-preview example](examples/semantic-rules/README.md):
+see the behavior in Python, preview the check offline, then optionally ask a configured provider.
+
 Write labelled requirements in `RULES.md`, one per list item:
 
 ```markdown
